@@ -110,8 +110,8 @@ All of this was reverse-engineered from USB traffic captures of the official Tic
 
 | | |
 |-|-|
-| **Claude** | Big Guy |
 | **Mikan** | Human Guy |
+| **Claude** | Big Guy (ai) |
 
 *2026*
 
