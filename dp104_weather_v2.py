@@ -32,12 +32,30 @@ def rgb(r, g, b):
     return (int(h*255), int(s*255), int(v*255))
 
 def dim(color, amount):
-    """Dim ONLY the brightness channel. Preserves hue and saturation."""
-    return (color[0], color[1], int(color[2] * amount))
+    """Dim ONLY the brightness channel. Preserves hue and saturation.
+    Clamps to val=20 minimum for colored pixels (sat>30) to avoid
+    the keyboard firmware red-rendering bug (confirmed threshold val<20)."""
+    v = int(color[2] * amount)
+    if 0 < v < 20 and color[1] > 30:
+        v = 20   # snap dim colored pixels to safe minimum white
+    # Strip hue from near-zero hue pixels with low sat — renders red on firmware
+    h = color[0]
+    s = color[1]
+    if (h < 5 or h > 250) and s < 40:
+        s = 0   # pure grey, no hue cast
+    return (h, s, v)
 
 def bright(color, v_255):
-    """Set brightness to absolute value 0-255. Preserves hue/sat."""
-    return (color[0], color[1], min(255, int(v_255)))
+    """Set brightness to absolute value 0-255. Preserves hue/sat.
+    Clamps to val=20 minimum for colored pixels — same safe threshold as dim()."""
+    v = min(255, int(v_255))
+    if 0 < v < 20 and color[1] > 30:
+        v = 20
+    h = color[0]
+    s = color[1]
+    if (h < 5 or h > 250) and s < 40:
+        s = 0
+    return (h, s, v)
 
 def glow(color, amount):
     """Additive brightness — for glows over black. Clamps to 255."""

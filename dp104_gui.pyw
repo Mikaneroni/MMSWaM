@@ -10,6 +10,22 @@ import sys, os, time, threading, importlib, re, subprocess, json, urllib.request
 _NO_WINDOW = 0x08000000
 from pathlib import Path
 
+# Optional: load dp104_nowplaying and dp104_discord if present alongside gui
+_NP_MOD = None
+_DISC_MOD = None
+try:
+    import importlib.util as _ilu
+    for _mod_name, _mod_var in [('dp104_nowplaying', '_NP_MOD'),
+                                  ('dp104_discord',   '_DISC_MOD')]:
+        _p = Path(__file__).parent / f"{_mod_name}.py"
+        if _p.exists():
+            _spec = _ilu.spec_from_file_location(_mod_name, str(_p))
+            _m    = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_m)
+            globals()[_mod_var] = _m
+except Exception:
+    pass
+
 try:
     import tkinter as tk
     from tkinter import ttk
@@ -559,8 +575,19 @@ class DP104App:
         self.debug_wx_var     = tk.IntVar(value=-1)   # -1 = use live weather code
         self.debug_wind_var   = tk.IntVar(value=0)    # wind override for debug
         # These are created in _build_ui; pre-declare so _load_settings can set them
-        self.np_enabled       = None
-        self.wx_enabled       = None
+        self.np_enabled         = None
+        self.wx_enabled         = None
+        self.discord_enabled    = None
+        # Discord state
+        self._discord_display   = None   # DiscordDisplay instance
+        self._discord_connected = False
+        self._discord_in_vc     = False
+        self._discord_thread    = None
+        self.last_np_source     = 'default'  # source key for NP pixel display
+        # NP pixel display
+        self._np_frames         = []
+        self._np_prev_idx       = 0
+        self._np_custom         = True   # True = pixel page, False = text scroll only
 
         self._build_ui()
         self._load_settings()   # load after vars exist
@@ -592,7 +619,7 @@ class DP104App:
             padx=8, pady=3, activebackground='#2a1218', activeforeground='#ff6e7d',
             command=self._stop_all)
         self.btn_stop.pack(side='right')
-        tk.Label(hdr, text="v1.1.3", font=('Consolas',7),
+        tk.Label(hdr, text="v1.2.0", font=('Consolas',7),
                  bg=BG, fg=DIM).pack(side='right', padx=(0,10))
 
         _divider(r, padx=14)
@@ -625,8 +652,10 @@ class DP104App:
             # Also bind on macOS two-finger click / Ctrl+click
             btn.bind('<Control-Button-1>', lambda e, v=val, ev=en_var: self._toggle_tab(v, ev))
 
+        self.discord_enabled = tk.BooleanVar(value=False)
         _make_tab('nowplaying', '  ♪  NOW PLAYING  ', self.np_enabled)
         _make_tab('weather',    '  ⛅  WEATHER  ',    self.wx_enabled)
+        _make_tab('discord',    '  🎮  DISCORD  ',    self.discord_enabled)
 
         self.mode_var.trace_add('write', self._style_tabs)
 
@@ -635,7 +664,35 @@ class DP104App:
         # ── Now Playing panel ──────────────────────────────────────────────────
         self.np_panel = _card(r)
 
-        _label(self.np_panel, "NOW PLAYING").pack(anchor='w', pady=(0,6))
+        np_hdr_row = tk.Frame(self.np_panel, bg=BG2)
+        np_hdr_row.pack(fill='x', pady=(0,6))
+        _label(np_hdr_row, "NOW PLAYING").pack(side='left')
+        # Custom pixel display toggle
+        self._np_custom_var = tk.BooleanVar(value=True)
+        def _on_np_custom_toggle():
+            self._np_custom = self._np_custom_var.get()
+            if not self._np_custom:
+                # Switch to scroll page
+                threading.Thread(
+                    target=lambda: send_to_keyboard(
+                        self.last_np[0] or '', self.last_np[1] or ''),
+                    daemon=True).start()
+                # Restore weather to custom page if enabled
+                if (not self._discord_in_vc and
+                        self._wx_frames and
+                        self.wx_enabled and self.wx_enabled.get()):
+                    threading.Thread(
+                        target=lambda: send_pixel_animation(
+                            list(self._wx_frames), fps=self._fps),
+                        daemon=True).start()
+            self._set_status(
+                "NP: custom pixel display" if self._np_custom else "NP: text scroll only")
+        tk.Checkbutton(np_hdr_row, text="Custom display",
+                       variable=self._np_custom_var,
+                       font=('Consolas',8), bg=BG2, fg=DIM,
+                       selectcolor=BG3, activebackground=BG2,
+                       activeforeground=FG, cursor='hand2',
+                       command=_on_np_custom_toggle).pack(side='right')
 
         self.lbl_title = tk.Label(self.np_panel, text="—",
                                    font=('Consolas',13,'bold'), bg=BG2, fg=ACC,
@@ -645,6 +702,17 @@ class DP104App:
                                     font=('Consolas',10), bg=BG2, fg=FG,
                                     wraplength=420, justify='left', anchor='w')
         self.lbl_artist.pack(fill='x')
+
+        # NP pixel preview
+        _divider(self.np_panel, pady=(8,6))
+        np_prev_hdr = tk.Frame(self.np_panel, bg=BG2)
+        np_prev_hdr.pack(fill='x', pady=(0,4))
+        _label(np_prev_hdr, "PREVIEW").pack(side='left')
+        self.lbl_np_frame = tk.Label(np_prev_hdr, text="",
+                                      font=('Consolas',8), bg=BG2, fg=DIM)
+        self.lbl_np_frame.pack(side='right')
+        self.np_preview = PixelPreview(self.np_panel)
+        self.np_preview.pack(anchor='w')
 
         _divider(self.np_panel, pady=(8,6))
         _label(self.np_panel, "ON KEYBOARD").pack(anchor='w', pady=(0,4))
@@ -738,6 +806,82 @@ class DP104App:
                                           wraplength=440, justify='left')
         self.lbl_wx_np_artist.pack(fill='x')
 
+        # ── Discord panel ─────────────────────────────────────────────────────
+        self.disc_panel = _card(r)
+
+        disc_title_row = tk.Frame(self.disc_panel, bg=BG2)
+        disc_title_row.pack(fill='x', pady=(0,8))
+        _label(disc_title_row, "DISCORD VC").pack(side='left')
+        self.lbl_disc_status = tk.Label(disc_title_row, text="● Disconnected",
+                                         font=('Consolas',8), bg=BG2, fg=RED)
+        self.lbl_disc_status.pack(side='right')
+
+        # Client ID row
+        cid_row = tk.Frame(self.disc_panel, bg=BG2)
+        cid_row.pack(fill='x', pady=(0,4))
+        _label(cid_row, "Client ID:", font=('Consolas',9), fg=FG).pack(side='left')
+        self.disc_cid_var = tk.StringVar(value='')
+        tk.Entry(cid_row, textvariable=self.disc_cid_var,
+                 font=('Consolas',9), bg=BG3, fg=FG, insertbackground=FG,
+                 relief='flat', width=22, show='',
+                 highlightthickness=1, highlightbackground=DIM,
+                 highlightcolor=ACC).pack(side='left', padx=(6,4))
+        self.btn_disc_connect = _btn(cid_row, "Connect", self._disc_connect,
+                                      fg=ACC, bg='#0d1a14')
+        self.btn_disc_connect.pack(side='left')
+
+        # Client Secret (first run only)
+        csec_row = tk.Frame(self.disc_panel, bg=BG2)
+        csec_row.pack(fill='x', pady=(0,6))
+        _label(csec_row, "Client Secret:", font=('Consolas',9), fg=FG).pack(side='left')
+        self.disc_csec_var = tk.StringVar(value='')
+        tk.Entry(csec_row, textvariable=self.disc_csec_var,
+                 font=('Consolas',9), bg=BG3, fg=FG, insertbackground=FG,
+                 relief='flat', width=22, show='*',
+                 highlightthickness=1, highlightbackground=DIM,
+                 highlightcolor=ACC).pack(side='left', padx=(6,4))
+        _label(csec_row, "(first run only)", font=('Consolas',7)).pack(side='left')
+
+        # Online status selector
+        _divider(self.disc_panel, pady=(0,6))
+        status_row = tk.Frame(self.disc_panel, bg=BG2)
+        status_row.pack(fill='x', pady=(0,6))
+        _label(status_row, "Online status:", font=('Consolas',9), fg=FG).pack(side='left')
+        self.disc_status_var = tk.StringVar(value='online')
+        for s_val, s_label, s_color in [
+            ('online',    'Online',    '#43b581'),
+            ('away',      'Away',      '#faa61a'),
+            ('dnd',       'DnD',       '#f04747'),
+            ('invisible', 'Invisible', '#747f8d'),
+        ]:
+            rb = tk.Radiobutton(status_row, text=s_label,
+                                variable=self.disc_status_var, value=s_val,
+                                font=('Consolas',8), bg=BG2, fg=s_color,
+                                selectcolor=BG3, activebackground=BG2,
+                                activeforeground=s_color, cursor='hand2',
+                                command=self._disc_set_status)
+            rb.pack(side='left', padx=(8,0))
+
+        # When in VC, fallback display
+        fallback_row = tk.Frame(self.disc_panel, bg=BG2)
+        fallback_row.pack(fill='x', pady=(0,4))
+        _label(fallback_row, "When not in VC show:",
+               font=('Consolas',9), fg=FG).pack(side='left')
+        self.disc_fallback_var = tk.StringVar(value='weather')
+        for fb_val, fb_label in [('weather', 'Weather'), ('nowplaying', 'Now Playing')]:
+            tk.Radiobutton(fallback_row, text=fb_label,
+                           variable=self.disc_fallback_var, value=fb_val,
+                           font=('Consolas',8), bg=BG2, fg=DIM,
+                           selectcolor=BG3, activebackground=BG2,
+                           activeforeground=FG, cursor='hand2').pack(side='left', padx=(8,0))
+
+        # Info note
+        _label(self.disc_panel,
+               "ℹ  Mic + deafen read automatically.  "
+               "Status must be set manually — Discord local IPC does not expose "
+               "presence without OAuth2.",
+               font=('Consolas',7), fg=DIM).pack(anchor='w', pady=(6,0))
+
         # ── Status bar ────────────────────────────────────────────────────────
         _divider(r, padx=14, pady=(6,0))
         status_bar = tk.Frame(r, bg=BG, padx=14, pady=6)
@@ -785,16 +929,49 @@ class DP104App:
         r.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
     def _style_tabs(self, *_):
-        """Colour the tab buttons: active=brighter, inactive=dimmer."""
-        active = self.mode_var.get()
+        """Colour tab buttons. Weather has 4 states based on Discord status."""
+        active    = self.mode_var.get()
+        disc_on   = self.discord_enabled and self.discord_enabled.get()
+        in_vc     = self._discord_in_vc
+        wx_on     = self.wx_enabled and self.wx_enabled.get()
+        np_on     = self.np_enabled and self.np_enabled.get()
+        disc_en   = disc_on
+
         for val, btn in self._tab_btns.items():
-            enabled = (self.np_enabled if val=='nowplaying' else self.wx_enabled).get()
-            if not enabled:
-                btn.config(bg='#2b0a0e', fg=RED)   # red = disabled
-            elif val == active:
-                btn.config(bg='#0d3b22', fg=ACC)   # bright green = active+enabled
-            else:
-                btn.config(bg='#0a1f13', fg='#00a060')  # dim green = inactive+enabled
+            is_active = (val == active)
+            dim_mult  = '' if is_active else '0a1f13'
+
+            if val == 'nowplaying':
+                enabled = np_on
+                if not enabled:
+                    btn.config(bg='#2b0a0e', fg=RED)
+                elif is_active:
+                    btn.config(bg='#0d3b22', fg=ACC)
+                else:
+                    btn.config(bg='#0a1f13', fg='#00a060')
+
+            elif val == 'weather':
+                if not wx_on:
+                    btn.config(bg='#2b0a0e', fg=RED)           # red: disabled
+                elif disc_en and in_vc:
+                    btn.config(bg='#2b1800', fg=ORG)            # orange: discord in VC
+                elif disc_en and not in_vc:
+                    btn.config(bg='#2b2b00', fg='#e0e000')      # yellow: discord active, no VC
+                elif is_active:
+                    btn.config(bg='#0d3b22', fg=ACC)            # green: normal active
+                else:
+                    btn.config(bg='#0a1f13', fg='#00a060')      # dim green: normal inactive
+
+            elif val == 'discord':
+                enabled = disc_en
+                if not enabled:
+                    btn.config(bg='#2b0a0e', fg=RED)
+                elif in_vc:
+                    btn.config(bg='#0d1a2b', fg=ACC2)           # blue: in VC
+                elif is_active:
+                    btn.config(bg='#0d3b22', fg=ACC)
+                else:
+                    btn.config(bg='#0a1f13', fg='#00a060')
 
     def _select_tab(self, val):
         """Left-click: switch active tab view."""
@@ -808,33 +985,43 @@ class DP104App:
         enabled = enabled_var.get()
 
         if not enabled:
-            # If we just disabled the active tab, switch to the other
+            # If we just disabled the active tab, switch to another enabled one
             if self.mode_var.get() == tab:
-                other    = 'weather' if tab == 'nowplaying' else 'nowplaying'
-                other_en = self.wx_enabled if other=='weather' else self.np_enabled
-                if other_en and other_en.get():
-                    self.mode_var.set(other)
-                    self._on_mode_change()
-            # Clear keyboard page for that service
+                for other in ['nowplaying', 'weather', 'discord']:
+                    if other == tab: continue
+                    other_en = {'nowplaying': self.np_enabled,
+                                'weather':    self.wx_enabled,
+                                'discord':    self.discord_enabled}.get(other)
+                    if other_en and other_en.get():
+                        self.mode_var.set(other)
+                        self._on_mode_change()
+                        break
+            # Service-specific cleanup
             def _clear():
                 if tab == 'nowplaying':
                     send_to_keyboard('', '')
                     self.last_np = (None, None)
                     self.root.after(0, self._update_np_display, '', '')
+                elif tab == 'discord':
+                    self._disc_disconnect()
             threading.Thread(target=_clear, daemon=True).start()
 
         self._style_tabs()
-        lbl = "Now Playing" if tab == 'nowplaying' else "Weather"
+        labels = {'nowplaying':'Now Playing','weather':'Weather','discord':'Discord'}
+        lbl = labels.get(tab, tab)
         self._set_status(f"{lbl} {'enabled' if enabled else 'disabled'}")
 
     def _on_mode_change(self):
         self.mode = self.mode_var.get()
         self.np_panel.pack_forget()
         self.wx_panel.pack_forget()
+        self.disc_panel.pack_forget()
         if self.mode == 'nowplaying':
             self.np_panel.pack(fill='x', padx=14, pady=(0,0))
-        else:
+        elif self.mode == 'weather':
             self.wx_panel.pack(fill='x', padx=14, pady=(0,0))
+        else:
+            self.disc_panel.pack(fill='x', padx=14, pady=(0,0))
         self.root.update_idletasks()
 
     def _on_interval(self):
@@ -864,13 +1051,18 @@ class DP104App:
 
     # ── Preview ticker ─────────────────────────────────────────────────────────
     def _tick_preview(self):
+        # Weather preview
         if self._wx_frames:
             idx = self._prev_idx % len(self._wx_frames)
             self.preview.set_frame(self._wx_frames[idx])
             self.lbl_frame.config(text=f"frame {idx+1} / {len(self._wx_frames)}")
             self._prev_idx += 1
-        # Match keyboard FPS. Keyboard has ~1s buffer load offset on first play,
-        # but the preview loops continuously so we just match the frame interval.
+        # NP pixel preview
+        if self._np_frames and self._np_custom:
+            ni = self._np_prev_idx % len(self._np_frames)
+            self.np_preview.set_frame(self._np_frames[ni])
+            self.lbl_np_frame.config(text=f"frame {ni+1} / {len(self._np_frames)}")
+            self._np_prev_idx += 1
         interval_ms = max(50, int(1000 / self._fps))
         self.root.after(interval_ms, self._tick_preview)
 
@@ -910,18 +1102,37 @@ class DP104App:
                             if result:
                                 title, artist = result
                                 if (title, artist) != self.last_np:
-                                    ok = send_to_keyboard(title, artist)
-                                    if ok:
-                                        self.last_np = (title, artist)
-                                        self.root.after(0, self._update_np_display,
-                                                        title, artist)
-                                        if self.mode == 'nowplaying':
-                                            self._set_status("Now Playing updated")
+                                    # Always send text scroll first
+                                    send_to_keyboard(title, artist)
+                                    self.last_np = (title, artist)
+                                    self.root.after(0, self._update_np_display,
+                                                    title, artist)
+                                    # If custom NP enabled and not Discord in VC, send pixel page
+                                    if (self._np_custom and _NP_MOD and
+                                            not self._discord_in_vc):
+                                        src = _NP_MOD.get_source(title)
+                                        self.last_np_source = src
+                                        frames = _NP_MOD.build_frames(src, True)
+                                        self._np_frames = frames
+                                        send_pixel_animation(frames, fps=self._fps)
+                                    if self.mode == 'nowplaying':
+                                        self._set_status("Now Playing updated")
                             else:
                                 if self.last_np != (None, None):
                                     send_to_keyboard('', '')
                                     self.last_np = (None, None)
+                                    self._np_frames = []
                                     self.root.after(0, self._update_np_display, '', '')
+                                    # NP stopped — restore weather to custom page if enabled
+                                    if (self._np_custom and
+                                            not self._discord_in_vc and
+                                            self._wx_frames and
+                                            self.wx_enabled and
+                                            self.wx_enabled.get()):
+                                        threading.Thread(
+                                            target=lambda: send_pixel_animation(
+                                                list(self._wx_frames), fps=self._fps),
+                                            daemon=True).start()
                         finally:
                             np_fetching = False
                     threading.Thread(target=_np_done, daemon=True).start()
@@ -1080,21 +1291,36 @@ class DP104App:
         else:
             frames = build_weather_frames(data)
         self._wx_frames = frames
-        self._set_status("Sending to keyboard...")
-        time.sleep(0.1)
-        ok, msg = send_pixel_animation(frames, fps=self._fps)
+        # Priority check: Discord VC or NP custom page takes over the pixel page.
+        # In those cases, update preview + cache frames but don't send to keyboard.
+        np_custom_active = (self._np_custom and
+                            bool(self._np_frames) and
+                            self.last_np != (None, None))
+        should_send = not self._discord_in_vc and not np_custom_active
+
+        if should_send:
+            self._set_status("Sending to keyboard...")
+            time.sleep(0.1)
+            ok, msg = send_pixel_animation(frames, fps=self._fps)
+        else:
+            ok  = True
+            msg = "queued"
+            reason = "Discord VC active" if self._discord_in_vc else "NP custom active"
+            self._set_status(f"Weather cached ({reason})")
+
         self._wx_sending = False
 
-        if ok:
-            ts = time.strftime('%m/%d/%y %H:%M:%S')
-            self.root.after(0, self.lbl_wx_updated.config,
-                            {'text': f"Last updated: {ts}", 'fg': ACC2})
-            self._set_status(
-                f"Weather sent  ·  {data['temp']}°F  {data['cond'][:28]}")
-            # Windows toast — only on successful weather send
-            _toast_weather(data)
-        else:
-            self._set_status(f"Send failed: {msg}")
+        ts = time.strftime('%m/%d/%y %H:%M:%S')
+        self.root.after(0, self.lbl_wx_updated.config,
+                        {'text': f"Last updated: {ts} {'(queued)' if not should_send else ''}",
+                         'fg': ACC2 if should_send else DIM})
+        if should_send:
+            if ok:
+                self._set_status(
+                    f"Weather sent  ·  {data['temp']}°F  {data['cond'][:28]}")
+                _toast_weather(data)
+            else:
+                self._set_status(f"Send failed: {msg}")
 
     def _update_np_display(self, title, artist):
         self.lbl_title.config(text=title or '—')
@@ -1105,6 +1331,79 @@ class DP104App:
         self.lbl_wx_np_artist.config(text=artist or '')
         if self.tray and title:
             self.tray.title = title[:30]
+
+    # ── Discord methods ───────────────────────────────────────────────────────
+    def _disc_connect(self):
+        """Start Discord IPC connection."""
+        if not _DISC_MOD:
+            self._set_status("dp104_discord.py not found in same folder")
+            return
+        cid = self.disc_cid_var.get().strip()
+        if not cid:
+            self._set_status("Enter a Discord Client ID first")
+            return
+        sec = self.disc_csec_var.get().strip() or None
+        self.root.after(0, self.lbl_disc_status.config,
+                        {'text': '● Connecting...', 'fg': ORG})
+        def _run():
+            try:
+                self._discord_display = _DISC_MOD.DiscordDisplay(
+                    client_id=cid,
+                    client_secret=sec,
+                    skin_dir=str(Path(__file__).parent / 'skins' / 'default'),
+                    fps=self._fps,
+                )
+                self._discord_display._ipc.on_state_change = self._disc_on_state
+                # Patch VC detection into the IPC run loop via monkey-patch
+                self._discord_display.start()
+                self._discord_connected = True
+                self.root.after(0, self.lbl_disc_status.config,
+                                {'text': '● Connected', 'fg': ACC})
+                self.root.after(0, self.btn_disc_connect.config,
+                                {'text': 'Disconnect', 'command': self._disc_disconnect})
+                self.root.after(0, self._style_tabs)
+            except Exception as e:
+                self._discord_connected = False
+                self.root.after(0, self.lbl_disc_status.config,
+                                {'text': f'● Error: {str(e)[:40]}', 'fg': RED})
+        self._discord_thread = threading.Thread(target=_run, daemon=True)
+        self._discord_thread.start()
+
+    def _disc_disconnect(self):
+        """Stop Discord IPC."""
+        if self._discord_display:
+            try: self._discord_display.stop()
+            except: pass
+            self._discord_display = None
+        self._discord_connected = False
+        self._discord_in_vc     = False
+        self.root.after(0, self.lbl_disc_status.config,
+                        {'text': '● Disconnected', 'fg': RED})
+        self.root.after(0, self.btn_disc_connect.config,
+                        {'text': 'Connect', 'command': self._disc_connect})
+        self._style_tabs()
+
+    def _disc_set_status(self):
+        """Update online status from selector."""
+        status = self.disc_status_var.get()
+        if self._discord_display:
+            self._discord_display.set_status(status)
+        self._set_status(f"Discord status → {status}")
+
+    def _disc_on_state(self, mic_muted, status, deafened):
+        """Called by DiscordDisplay when mic/deafen/status changes."""        # If in VC (mic or deafen state received) — show Discord skin, pause weather
+        self._discord_in_vc = True   # any IPC state update = we're active
+        self.root.after(0, self._style_tabs)
+
+    def _disc_on_vc_leave(self):
+        """Called when user leaves VC — revert to fallback display."""
+        self._discord_in_vc = False
+        self.root.after(0, self._style_tabs)
+        fallback = self.disc_fallback_var.get() if hasattr(self, 'disc_fallback_var') else 'weather'
+        if fallback == 'weather' and self.wx_enabled and self.wx_enabled.get():
+            threading.Thread(target=self._do_fetch_weather, daemon=True).start()
+        elif fallback == 'nowplaying' and self._np_frames:
+            send_pixel_animation(list(self._np_frames), fps=self._fps)
 
     def _on_temp_override_toggle(self):
         """Enable/disable the temp override entry field."""
@@ -1147,6 +1446,17 @@ class DP104App:
                     self.np_enabled.set(bool(s['np_enabled']))
                 if 'wx_enabled'  in s and self.wx_enabled:
                     self.wx_enabled.set(bool(s['wx_enabled']))
+                if 'disc_enabled' in s and self.discord_enabled:
+                    self.discord_enabled.set(bool(s['disc_enabled']))
+                if 'disc_client_id' in s and hasattr(self,'disc_cid_var'):
+                    self.disc_cid_var.set(s['disc_client_id'])
+                if 'disc_status' in s and hasattr(self,'disc_status_var'):
+                    self.disc_status_var.set(s['disc_status'])
+                if 'disc_fallback' in s and hasattr(self,'disc_fallback_var'):
+                    self.disc_fallback_var.set(s['disc_fallback'])
+                if 'np_custom' in s and hasattr(self,'_np_custom_var'):
+                    self._np_custom_var.set(bool(s['np_custom']))
+                    self._np_custom = bool(s['np_custom'])
         except Exception:
             pass  # silently ignore corrupt settings
 
@@ -1154,13 +1464,18 @@ class DP104App:
         """Persist settings to JSON on exit."""
         try:
             s = {
-                'location':   self.loc_var.get(),
-                'poll_sec':   self.interval_var.get(),
-                'wx_refresh': self.wx_int_var.get(),
-                'fps':        self.fps_var.get(),
-                'mode':       self.mode_var.get(),
-                'np_enabled': self.np_enabled.get() if self.np_enabled else True,
-                'wx_enabled': self.wx_enabled.get() if self.wx_enabled else True,
+                'location':        self.loc_var.get(),
+                'poll_sec':        self.interval_var.get(),
+                'wx_refresh':      self.wx_int_var.get(),
+                'fps':             self.fps_var.get(),
+                'mode':            self.mode_var.get(),
+                'np_enabled':      self.np_enabled.get()      if self.np_enabled      else True,
+                'wx_enabled':      self.wx_enabled.get()      if self.wx_enabled      else True,
+                'disc_enabled':    self.discord_enabled.get() if self.discord_enabled else False,
+                'disc_client_id':  self.disc_cid_var.get()    if hasattr(self,'disc_cid_var')  else '',
+                'disc_status':     self.disc_status_var.get() if hasattr(self,'disc_status_var') else 'online',
+                'disc_fallback':   self.disc_fallback_var.get() if hasattr(self,'disc_fallback_var') else 'weather',
+                'np_custom':       self._np_custom_var.get()  if hasattr(self,'_np_custom_var') else True,
             }
             self._settings_path.write_text(json.dumps(s, indent=2))
         except Exception:
@@ -1174,7 +1489,7 @@ class DP104App:
             return
 
         win = tk.Toplevel(self.root)
-        win.title("Debug  —  DP-104  v1.1.3")
+        win.title("Debug  —  DP-104  v1.2.0")
         win.configure(bg=BG)
         win.resizable(False, False)
         win.transient(self.root)          # attached to parent: hides with it, no always-on-top
