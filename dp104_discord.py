@@ -493,9 +493,22 @@ class DiscordIPC:
             return 0.0
 
     def _check_idle(self):
-        """Update status based on system idle time. Fires callback if changed."""
+        """Update status based on system idle time.
+        - dnd / invisible: never touched (always manual)
+        - away (manual, i.e. user set it): respected, not flipped back to online
+        - online / away (auto): normal idle cycling
+        """
         if not self._idle_monitoring:
             return
+
+        manual = self._manual_status_set
+        # Never override deliberate manual statuses
+        if self.status in ('dnd', 'invisible'):
+            return
+        # User explicitly chose Away — don't auto-flip back to online
+        if manual == 'away' and self.status == 'away':
+            return
+
         idle = self._get_idle_seconds()
         new_status = 'away' if idle >= self._idle_threshold else 'online'
         if new_status != self.status:
@@ -585,19 +598,6 @@ class DiscordIPC:
                         print(f"[IPC] ERROR code={d.get('code')} msg={d.get('message')}")
                     if cmd == 'GET_VOICE_SETTINGS' and evt != 'ERROR':
                         self._apply_voice_settings(d)
-                    elif cmd == 'GET_SELECTED_VOICE_CHANNEL':
-                        # id present = in a VC; empty/null = not in VC
-                        in_vc = bool(d and d.get('id'))
-                        if in_vc and not self._in_vc:
-                            print(f"[Discord IPC] Joined: {d.get('name','?')}")
-                            self._in_vc = True
-                            if self.on_vc_join:
-                                self.on_vc_join()
-                        elif not in_vc and self._in_vc and self._ever_received:
-                            print("[Discord IPC] Left voice channel")
-                            self._in_vc = False
-                            if self.on_vc_leave:
-                                self.on_vc_leave()
                 else:
                     time.sleep(0.05)   # 50ms idle — near-zero CPU
 

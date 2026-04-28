@@ -122,26 +122,25 @@ def _send_direct(frames, fps=10, retries=3, retry_delay=2.0):
 
 class _PixelQueue:
     """Single-worker priority queue for keyboard pixel sends.
-    Highest-priority pending send wins. 4-second cooldown between sends
-    gives the keyboard time to reload its animation buffer."""
-    COOLDOWN = 4.0   # seconds between sends
+    Highest-priority pending send wins. 4-second cooldown between sends."""
+    COOLDOWN = 4.0
 
     def __init__(self):
         self._lock    = threading.Lock()
         self._event   = threading.Event()
-        self._pending = {}   # priority -> (frames, fps)
+        self._pending = {}   # priority -> (frames, fps, on_complete)
         self._running = True
         t = threading.Thread(target=self._worker, daemon=True)
         t.start()
 
-    def submit(self, priority, frames, fps):
-        """Queue a send. Drops any pending send of same or lower priority."""
+    def submit(self, priority, frames, fps, on_complete=None):
+        """Queue a send. Drops any pending send of same or lower priority.
+        on_complete(ok, msg) called on the worker thread after send finishes."""
         with self._lock:
-            # Discard lower-priority queued sends (higher prio_number = lower prio)
             stale = [p for p in self._pending if p >= priority]
             for p in stale:
                 del self._pending[p]
-            self._pending[priority] = (list(frames), fps)
+            self._pending[priority] = (list(frames), fps, on_complete)
         self._event.set()
 
     def _worker(self):
@@ -152,12 +151,12 @@ class _PixelQueue:
                 if not self._pending:
                     continue
                 best = min(self._pending)
-                frames, fps = self._pending.pop(best)
-            # Execute — direct call bypasses the queue (we're already serialized)
-            _send_direct(frames, fps)
-            # Cooldown gives keyboard time to reload animation buffer
+                frames, fps, on_complete = self._pending.pop(best)
+            ok, msg = _send_direct(frames, fps)
+            if on_complete:
+                try: on_complete(ok, msg)
+                except Exception: pass
             time.sleep(self.COOLDOWN)
-            # If more work arrived during cooldown, wake up
             if self._pending:
                 self._event.set()
 
@@ -169,7 +168,7 @@ MAX_TEXT_LEN     = 30
 PIXEL_W, PIXEL_H = 24, 8
 FRAME_BYTES      = PIXEL_W * PIXEL_H * 3
 
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.8"
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 BG   = '#0b0c14'   # near-black background
@@ -255,11 +254,10 @@ def send_pixel_frames(dev, frames, fps=10):
             time.sleep(0.320)
 
 # ── Public pixel send API (routes through priority queue) ─────────────────────
-def send_pixel_animation(frames, fps=10, priority=PRIO_WEATHER):
+def send_pixel_animation(frames, fps=10, priority=PRIO_WEATHER, on_complete=None):
     """Submit a pixel animation to the priority queue.
-    priority: PRIO_DISCORD(1), PRIO_NP(2), or PRIO_WEATHER(3).
-    Returns immediately — actual send happens in queue worker with 4s cooldown."""
-    _PIXEL_QUEUE.submit(priority, frames, fps)
+    on_complete(ok, msg) is called on the worker thread after the send finishes."""
+    _PIXEL_QUEUE.submit(priority, frames, fps, on_complete=on_complete)
     return True, "queued"
 
 # ── HID helpers ───────────────────────────────────────────────────────────────
@@ -306,8 +304,8 @@ def _load_weather_mod():
         mod  = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
-    except Exception:
-        return None
+    except Exception as _e:
+        return {'_error': str(_e)}
 
 _WX_MOD = _load_weather_mod()
 
@@ -448,12 +446,33 @@ def fetch_weather(location="03275"):
                      parse_t(astronomy.get('sunset', '08:00 PM'))
         except Exception:
             is_day = 6 <= __import__('datetime').datetime.now().hour < 20
+        # Map wttr.in weather code to DP-104 animation code
+        wttr_code = int(cur.get('weatherCode', 113))
+        is_night  = not is_day
+        if wttr_code in (113,):                          # clear
+            wx_code = 6 if is_night else 0
+        elif wttr_code in (116,):                        # partly cloudy
+            wx_code = 7 if is_night else 1
+        elif wttr_code in (119, 122, 143, 248, 260):     # cloudy/overcast/fog
+            wx_code = 2
+        elif wttr_code in (176,179,182,185,281,284,
+                           263,266,293,296,299,302,
+                           305,308,353,356,359):         # rain/drizzle
+            wx_code = 3
+        elif wttr_code in (227,230,320,323,326,329,
+                           332,335,338,350,368,371,374,377): # snow/sleet
+            wx_code = 4
+        elif wttr_code in (389,392,395,200,386):         # thunder
+            wx_code = 5
+        else:
+            wx_code = 6 if is_night else 0
         return {
             'temp': cur['temp_F'], 'feels': cur['FeelsLikeF'],
             'humid': cur['humidity'], 'wind': cur['windspeedMiles'],
             'wdir': cur.get('winddir16Point',''), 'cond': cur['weatherDesc'][0]['value'],
             'high': day['maxtempF'], 'low': day['mintempF'],
             'is_day': is_day, 'display_name': display_name,
+            'wx_code': wx_code,
         }
     except Exception:
         return None
@@ -510,14 +529,15 @@ PAGE_SCROLL = 6   # scrolling text (NP)
 
 def switch_page(dev, page):
     """Switch keyboard display page. Send two HID packets.
-    page: PAGE_OFF(0), PAGE_CUSTOM(2), PAGE_SCROLL(6)"""
-    # Packet 1: [0x07, 0x1a, 0x02, page, 0x00 ...]
-    pkt1 = [0x00, 0x07, 0x1a, 0x02, page] + [0x00]*27
-    dev.write(pkt1[:33])
+    page: PAGE_OFF(0), PAGE_CUSTOM(2), PAGE_SCROLL(6)
+    Format: report_id(0x00) + 32 data bytes = 33 bytes total."""
+    # Packet 1: report_id + [0x07, 0x1a, 0x02, page] + 28 padding bytes = 33
+    pkt1 = [0x00] + [0x07, 0x1a, 0x02, page] + [0x00]*28
+    dev.write(pkt1)   # 1 + 4 + 28 = 33 bytes ✓
     import time; time.sleep(0.05)
-    # Packet 2: [0x09, 0x1a, 0x00 ...]
-    pkt2 = [0x00, 0x09, 0x1a, 0x00] + [0x00]*29
-    dev.write(pkt2[:33])
+    # Packet 2: report_id + [0x09, 0x1a, 0x00] + 29 padding bytes = 33
+    pkt2 = [0x00] + [0x09, 0x1a, 0x00] + [0x00]*29
+    dev.write(pkt2)   # 1 + 3 + 29 = 33 bytes ✓
 
 def switch_page_safe(page):
     """Open keyboard, switch page, close. Safe to call from any thread."""
@@ -677,6 +697,7 @@ class DP104App:
         self.root = tk.Tk()
         self.root.title("DP-104 Controller")
         self.root.report_callback_exception = _report_callback_error
+        self.root.bind('<<ShowWindow>>', self._do_show_window)
         self.root.resizable(True, True)
         self.root.minsize(480, 540)
         self.root.configure(bg=BG)
@@ -884,6 +905,9 @@ class DP104App:
         self.lbl_wx_updated = tk.Label(meta_row, text="Last updated: never",
                                         font=('Consolas',8), bg=BG2, fg=DIM)
         self.lbl_wx_updated.pack(side='left')
+        self.lbl_wx_next = tk.Label(meta_row, text="",
+                                     font=('Consolas',8), bg=BG2, fg=DIM)
+        self.lbl_wx_next.pack(side='left', padx=(10,0))
         tk.Label(meta_row, text="   Auto-refresh:", font=('Consolas',8),
                  bg=BG2, fg=DIM).pack(side='left')
         self.wx_int_var = tk.StringVar(value='240')
@@ -963,12 +987,42 @@ class DP104App:
         csec_row.pack(fill='x', pady=(0,6))
         _label(csec_row, "Client Secret:", font=('Consolas',9), fg=FG).pack(side='left')
         self.disc_csec_var = tk.StringVar(value='')
-        tk.Entry(csec_row, textvariable=self.disc_csec_var,
+        self._disc_csec_entry = tk.Entry(csec_row, textvariable=self.disc_csec_var,
                  font=('Consolas',9), bg=BG3, fg=FG, insertbackground=FG,
                  relief='flat', width=22, show='*',
                  highlightthickness=1, highlightbackground=DIM,
-                 highlightcolor=ACC).pack(side='left', padx=(6,4))
+                 highlightcolor=ACC)
+        self._disc_csec_entry.pack(side='left', padx=(6,4))
         _label(csec_row, "(first run only)", font=('Consolas',7)).pack(side='left')
+
+        # Save secret to settings on change
+        self.disc_csec_var.trace_add('write', lambda *_: None)
+
+        # Credential rows reference for collapse
+        self._disc_cid_row  = cid_row
+        self._disc_csec_row = csec_row
+        self._disc_creds_visible = True
+
+        def _toggle_creds():
+            if self._disc_creds_visible:
+                import tkinter.messagebox as _mb
+                msg = ("You are about to reveal your Discord Client Secret.\n\n"
+                       "Make sure nobody can see your screen.\n\nContinue?")
+                if not _mb.askyesno("Security Warning", msg, icon='warning'):
+                    return
+            self._disc_creds_visible = not self._disc_creds_visible
+            if self._disc_creds_visible:
+                self._disc_cid_row.pack(fill='x', pady=(0,4))
+                self._disc_csec_row.pack(fill='x', pady=(0,6))
+                self._btn_show_creds.config(text="🔒  Hide credentials")
+            else:
+                self._disc_cid_row.pack_forget()
+                self._disc_csec_row.pack_forget()
+                self._btn_show_creds.config(text="🔑  Show credentials")
+
+        self._btn_show_creds = _btn(self.disc_panel, "🔒  Hide credentials",
+                                     _toggle_creds, fg=DIM, bg=BG3)
+        self._btn_show_creds.pack(anchor='w', pady=(0,4))
 
         # Online status selector
         _divider(self.disc_panel, pady=(0,6))
@@ -1036,6 +1090,17 @@ class DP104App:
                                             anchor='w', padx=8, pady=4,
                                             wraplength=440, justify='left')
         self.lbl_disc_np_artist.pack(fill='x')
+
+        # ── Discord pixel preview ──────────────────────────────────────────────
+        _divider(self.disc_panel, pady=(10,6))
+        disc_prev_row = tk.Frame(self.disc_panel, bg=BG2)
+        disc_prev_row.pack(fill='x', pady=(0,4))
+        _label(disc_prev_row, "PREVIEW").pack(side='left')
+        self.lbl_disc_state = tk.Label(disc_prev_row, text="— not connected —",
+                                        font=('Consolas',8), bg=BG2, fg=DIM)
+        self.lbl_disc_state.pack(side='right')
+        self.disc_preview = PixelPreview(self.disc_panel)
+        self.disc_preview.pack(anchor='w')
 
         # ── Status bar ────────────────────────────────────────────────────────
         _divider(r, padx=14, pady=(6,0))
@@ -1204,8 +1269,30 @@ class DP104App:
             threading.Thread(target=self.tray.run, daemon=True).start()
 
     def _show_window(self, icon=None, item=None):
-        self.root.after(0, self.root.deiconify)
-        self.root.after(0, self.root.lift)
+        """Called from pystray thread. event_generate is the only thread-safe
+        tkinter call — posts <<ShowWindow>> to the main loop event queue."""
+        try:
+            self.root.event_generate('<<ShowWindow>>', when='tail')
+        except Exception:
+            pass
+
+    def _do_show_window(self, event=None):
+        """Actual restore — runs on main tkinter thread via <<ShowWindow>> event."""
+        try:
+            self.root.deiconify()
+            self.root.state('normal')
+            self.root.attributes('-topmost', True)
+            self.root.update()
+            self.root.attributes('-topmost', False)
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
+        try:
+            if self.tray:
+                self.tray.visible = False
+        except Exception:
+            pass
 
     # ── Preview ticker ─────────────────────────────────────────────────────────
     def _tick_preview(self):
@@ -1229,7 +1316,7 @@ class DP104App:
         self.running = not self.running
         if self.running:
             self.btn_pause.config(text="⏸  PAUSE")
-            self._set_status("Polling...")
+            self._set_status("Running")
             if not self.thread or not self.thread.is_alive():
                 self.thread = threading.Thread(target=self._poll_loop, daemon=True)
                 self.thread.start()
@@ -1244,8 +1331,8 @@ class DP104App:
         """
         # Start countdown at interval so weather doesn't fire on very first tick.
         # Settings may not be fully loaded yet when the thread starts.
-        try:    wx_countdown = int(self.wx_int_var.get()) * 60
-        except: wx_countdown = 240 * 60
+        try:    wx_countdown = -5   # fire first fetch ~5s after startup
+        except: wx_countdown = -5
         wx_fetching  = False
         np_fetching  = False
 
@@ -1253,7 +1340,7 @@ class DP104App:
             if self.running:
 
                 # ── Now Playing — runs when enabled, regardless of active tab ──
-                np_on = not self.np_enabled or self.np_enabled.get()
+                np_on = bool(self.np_enabled and self.np_enabled.get())
                 if np_on and not np_fetching:
                     np_fetching = True
                     def _np_done():
@@ -1276,10 +1363,17 @@ class DP104App:
                                         self.last_np_source  = src
                                         self._np_frames      = frames
                                         self._np_prev_idx    = 0
-                                        send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP)
+                                        _src = src
+                                        def _np_sent(ok, msg, _src=_src):
+                                            if ok:
+                                                self._set_status(f"NP sent ✓  [{_src}]")
+                                            else:
+                                                self._set_status(f"NP send failed: {msg}")
+                                        send_pixel_animation(frames, fps=self._fps,
+                                                             priority=PRIO_NP,
+                                                             on_complete=_np_sent)
                                         if self.mode == 'nowplaying':
-                                            self._set_status(
-                                                f"Now Playing updated  [{src}]")
+                                            self._set_status(f"Now Playing sending  [{src}]")
                                     else:
                                         if self.mode == 'nowplaying':
                                             self._set_status("Now Playing updated (text only)")
@@ -1304,7 +1398,7 @@ class DP104App:
                     threading.Thread(target=_np_done, daemon=True).start()
 
                 # ── Weather — runs when enabled, regardless of active tab ───
-                wx_on = not self.wx_enabled or self.wx_enabled.get()
+                wx_on = bool(self.wx_enabled and self.wx_enabled.get())
                 if wx_on and wx_countdown <= 0 and not wx_fetching:
                     wx_fetching = True
                     def _wx_done():
@@ -1312,7 +1406,7 @@ class DP104App:
                         try:
                             self._do_fetch_weather()
                         finally:
-                            try: wx_countdown = int(self.wx_int_var.get()) * 60
+                            try: wx_countdown = max(60, int(self.wx_int_var.get()) * 60)
                             except: wx_countdown = 14400
                             wx_fetching = False
                     threading.Thread(target=_wx_done, daemon=True).start()
@@ -1320,18 +1414,7 @@ class DP104App:
                     wx_countdown -= self.interval
                     mins = max(0, wx_countdown) // 60
                     secs = max(0, wx_countdown) % 60
-                    if self.mode == 'weather':
-                        self._set_status(
-                            f"Next weather refresh in {mins}m {secs:02d}s")
-                    else:
-                        self._set_status(
-                            f"Weather refreshes in {mins}m {secs:02d}s  |  NP active")
-                elif not wx_on and not np_on:
-                    self._set_status("All services disabled")
-                elif not wx_on:
-                    self._set_status("Weather disabled  |  NP active")
-                elif not np_on:
-                    self._set_status("NP disabled  |  Weather active")
+                    self.root.after(0, self._update_wx_countdown, mins, secs)
 
             time.sleep(self.interval)
 
@@ -1364,7 +1447,10 @@ class DP104App:
                     src    = _NP_MOD.get_source(app_id)
                     frames = _NP_MOD.build_frames(src, True)
                     self._np_frames = frames
-                    send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP)
+                    send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP,
+                                         on_complete=lambda ok,msg:
+                                             self._set_status("NP sent ✓" if ok
+                                                              else f"NP send failed: {msg}"))
             self._do_fetch_weather()
         threading.Thread(target=_do, daemon=True).start()
 
@@ -1382,8 +1468,11 @@ class DP104App:
                             src    = _NP_MOD.get_source(app_id)
                             frames = _NP_MOD.build_frames(src, True)
                             self._np_frames = frames
-                            send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP)
-                        self._set_status("Sent")
+                            send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP,
+                                                 on_complete=lambda ok,msg:
+                                                     self._set_status("NP sent ✓" if ok
+                                                                      else f"NP send failed: {msg}"))
+                        self._set_status("Text scroll sent")
                     else:
                         self._set_status("Send failed")
                 else:
@@ -1434,36 +1523,28 @@ class DP104App:
         # Hard gate: never run if weather disabled
         if self.wx_enabled and not self.wx_enabled.get():
             return
-        if self._wx_sending:
-            if time.time() - getattr(self, '_wx_send_start', 0) < 120:
-                self._set_status("Already sending, please wait...")
-                return
-            else:
-                self._wx_sending = False
 
-        self._wx_sending = True
-        self._wx_send_start = time.time()
         loc = self.loc_var.get().strip() or "03275"
 
         try:
-            # Resolve zip → city if needed
-            import dp104_weather_v2 as _WX
-            data = _WX.fetch_weather(loc)
+            data = fetch_weather(loc)
         except Exception as e:
-            self._wx_sending = False
             self._set_status(f"Weather fetch failed: {e}")
             return
 
-        if not data:
-            self._wx_sending = False
-            self._set_status("Weather: no data returned")
+        if not data or '_error' in data:
+            err = data.get('_error', 'no data') if data else 'no data'
+            self._set_status(f"Weather fetch failed: {err}")
             return
 
         # Store for debug menu
         self._last_wx_data = data
 
-        # Debug overrides
+        # Build animation frames using the pre-loaded weather module
         try:
+            if _WX_MOD is None:
+                self._set_status("Weather build failed: dp104_weather_v2.py not found")
+                return
             code = self.debug_wx_var.get()
             temp_f = int(data.get('temp', 72))
             high_f = int(data.get('high', 85))
@@ -1474,13 +1555,9 @@ class DP104App:
                 except: pass
             if hasattr(self, 'debug_wind_var'):
                 wind = self.debug_wind_var.get()
-            import dp104_weather_v2 as _WX2
-            if code == -1:
-                frames = _WX2.build_frames(data['code'], temp_f, high_f, low_f, wind)
-            else:
-                frames = _WX2.build_frames(code, temp_f, high_f, low_f, wind)
+            wx_code = int(data.get('wx_code', 0)) if code == -1 else code
+            frames = _WX_MOD.build_frames(wx_code, temp_f, high_f, low_f, wind)
         except Exception as e:
-            self._wx_sending = False
             self._set_status(f"Weather build failed: {e}")
             return
 
@@ -1488,20 +1565,28 @@ class DP104App:
         self._prev_idx  = 0
 
         # Update the weather panel display
-        self.root.after(0, self.lbl_wx_temp.config,
-                        {'text': f"{data.get('temp','?')}°F"})
-        self.root.after(0, self.lbl_wx_cond.config,
-                        {'text': data.get('cond', '')[:32]})
+        self.root.after(0, self.lbl_weather.config,
+                        {'text': f"{data.get('cond','?')}  ·  {data.get('temp','?')}°F  "
+                                 f"(feels {data.get('feels','?')}°F)  "
+                                 f"High {data.get('high','?')}°  Low {data.get('low','?')}°",
+                         'fg': FG})
 
-        # Submit to priority queue — Discord/NP at higher priority will win
-        send_pixel_animation(frames, fps=self._fps, priority=PRIO_WEATHER)
+        # Submit to priority queue — status updates when send actually completes
+        temp_str = data.get('temp','?')
+        cond_str = data.get('cond','')[:28]
+        self._set_status(f"Weather sending  ·  {temp_str}°F  {cond_str}")
 
-        self._wx_sending = False
-        ts = time.strftime('%m/%d/%y %H:%M:%S')
-        self.root.after(0, self.lbl_wx_updated.config,
-                        {'text': f"Last updated: {ts}", 'fg': ACC2})
-        self._set_status(f"Weather queued  ·  {data.get('temp','?')}°F  "
-                         f"{data.get('cond','')[:28]}")
+        def _wx_sent(ok, msg):
+            ts = time.strftime('%m/%d/%y %H:%M:%S')
+            self.root.after(0, self.lbl_wx_updated.config,
+                            {'text': f"Last updated: {ts}", 'fg': ACC2})
+            if ok:
+                self._set_status(f"Weather sent ✓  ·  {temp_str}°F  {cond_str}")
+            else:
+                self._set_status(f"Weather send failed: {msg}")
+
+        send_pixel_animation(frames, fps=self._fps, priority=PRIO_WEATHER,
+                             on_complete=_wx_sent)
         _toast_weather(data)
 
     # ── Settings ──────────────────────────────────────────────────────────────
@@ -1518,6 +1603,7 @@ class DP104App:
                 'wx_enabled':      self.wx_enabled.get()       if self.wx_enabled       else True,
                 'disc_enabled':    self.discord_enabled.get()  if self.discord_enabled  else False,
                 'disc_client_id':  self.disc_cid_var.get()     if hasattr(self,'disc_cid_var')        else '',
+                'disc_client_secret': self.disc_csec_var.get() if hasattr(self,'disc_csec_var') else '',
                 'disc_status':     self.disc_status_var.get()  if hasattr(self,'disc_status_var')     else 'online',
                 'disc_fallback':   self.disc_fallback_var.get() if hasattr(self,'disc_fallback_var')  else 'weather',
                 'disc_autoconnect': self.disc_autoconnect_var.get() if hasattr(self,'disc_autoconnect_var') else False,
@@ -1551,6 +1637,8 @@ class DP104App:
                 self.discord_enabled.set(bool(s['disc_enabled']))
             if 'disc_client_id' in s and hasattr(self,'disc_cid_var'):
                 self.disc_cid_var.set(s['disc_client_id'])
+            if 'disc_client_secret' in s and s.get('disc_client_secret') and hasattr(self,'disc_csec_var'):
+                self.disc_csec_var.set(s['disc_client_secret'])
             if 'disc_status' in s and hasattr(self,'disc_status_var'):
                 self.disc_status_var.set(s['disc_status'])
             if 'disc_fallback' in s and hasattr(self,'disc_fallback_var'):
@@ -1569,30 +1657,61 @@ class DP104App:
     _last_wx_ts   = ""
     _last_np_ts   = ""
 
+    _status_clear_id = None
+
     def _set_status(self, msg):
         ts = time.strftime('%H:%M:%S')
-        if msg.startswith("Discord:") or msg.startswith("Discord "):
+        # Track per-service last-sent timestamps
+        if msg.startswith("Discord") or "disc" in msg.lower():
             DP104App._last_disc_ts = ts
-        elif "Weather" in msg or "weather" in msg or "wx" in msg.lower():
+        elif "Weather" in msg or "weather" in msg:
             DP104App._last_wx_ts = ts
-        elif "Now Playing" in msg or "NP " in msg:
+        elif "Now Playing" in msg or "NP " in msg or msg.startswith("NP"):
             DP104App._last_np_ts = ts
         self.root.after(0, self._refresh_status_bar, ts, msg)
+        # After 5s clear the main message — leave only service timestamps
+        # Don't auto-clear errors so the user can see them
+        if "failed" not in msg.lower() and "error" not in msg.lower():
+            def _clear():
+                try: self._refresh_status_bar("", "")
+                except Exception: pass
+            try:
+                if DP104App._status_clear_id:
+                    self.root.after_cancel(DP104App._status_clear_id)
+                DP104App._status_clear_id = self.root.after(5000, _clear)
+            except Exception:
+                pass
 
     def _refresh_status_bar(self, ts, msg):
-        parts = [f"{ts}  {msg}"]
-        if DP104App._last_wx_ts:
-            parts.append(f"wx:{DP104App._last_wx_ts}")
-        if DP104App._last_np_ts:
-            parts.append(f"np:{DP104App._last_np_ts}")
-        if DP104App._last_disc_ts:
-            parts.append(f"disc:{DP104App._last_disc_ts}")
+        """Status bar: main message for 5s then just service timestamps."""
         try:
-            self.lbl_status.config(text="  ·  ".join(parts))
+            wx_on   = self.wx_enabled   and self.wx_enabled.get()
+            np_on   = self.np_enabled   and self.np_enabled.get()
+            disc_on = self.discord_enabled and self.discord_enabled.get()
+            stamps = []
+            if wx_on   and DP104App._last_wx_ts:   stamps.append(f"wx:{DP104App._last_wx_ts}")
+            if np_on   and DP104App._last_np_ts:   stamps.append(f"np:{DP104App._last_np_ts}")
+            if disc_on and DP104App._last_disc_ts: stamps.append(f"disc:{DP104App._last_disc_ts}")
+            if msg:
+                prefix = f"{ts}  {msg}" if ts else msg
+                text   = f"{prefix}  ·  {'  ·  '.join(stamps)}" if stamps else prefix
+            else:
+                text   = "  ·  ".join(stamps) if stamps else "Ready"
+            self.lbl_status.config(text=text)
         except Exception:
             pass
 
     # ── Discord methods ───────────────────────────────────────────────────────
+    def _update_wx_countdown(self, mins, secs):
+        """Update next-refresh countdown in the weather tab."""
+        try:
+            if mins > 0:
+                self.lbl_wx_next.config(text=f"  ·  next in {mins}m {secs:02d}s")
+            else:
+                self.lbl_wx_next.config(text=f"  ·  next in {secs}s")
+        except Exception:
+            pass
+
     def _check_skin_folder(self):
         """Warn if skins/default missing or incomplete."""
         skin_dir = Path(__file__).parent / 'skins' / 'default'
@@ -1649,6 +1768,17 @@ class DP104App:
                         {'text': '● Connecting...', 'fg': ORG})
         self.root.after(0, self.btn_disc_connect.config,
                         {'text': 'Disconnect', 'command': self._disc_disconnect})
+        # Collapse credentials for cleanliness once connected
+        def _collapse_creds():
+            try:
+                if self._disc_creds_visible:
+                    self._disc_cid_row.pack_forget()
+                    self._disc_csec_row.pack_forget()
+                    self._disc_creds_visible = False
+                    self._btn_show_creds.config(text="🔑  Show credentials")
+            except Exception:
+                pass
+        self.root.after(500, _collapse_creds)
 
         def _on_ipc_ready():
             self.root.after(0, self.lbl_disc_status.config,
@@ -1709,6 +1839,15 @@ class DP104App:
                         {'text': '● Disconnected', 'fg': RED})
         self.root.after(0, self.btn_disc_connect.config,
                         {'text': 'Connect', 'command': self._disc_connect})
+        # Re-show credentials on disconnect
+        try:
+            if not self._disc_creds_visible:
+                self._disc_cid_row.pack(fill='x', pady=(0,4))
+                self._disc_csec_row.pack(fill='x', pady=(0,6))
+                self._disc_creds_visible = True
+                self._btn_show_creds.config(text="🔒  Hide credentials")
+        except Exception:
+            pass
         self._style_tabs()
 
     def _disc_set_status(self):
@@ -1735,10 +1874,17 @@ class DP104App:
         print(f"[Discord GUI] State → key={key}  queuing PRIO_DISCORD send")
         self.root.after(0, self._update_disc_preview, frame, key,
                         mic_muted, status, deafened)
-        send_pixel_animation([frame], fps=self._fps, priority=PRIO_DISCORD)
-        self._set_status(
-            f"Discord: mic={'muted' if mic_muted else 'live'} "
-            f"deaf={'yes' if deafened else 'no'} status={status}")
+        _mic  = 'muted' if mic_muted else 'live'
+        _deaf = 'yes'   if deafened  else 'no'
+        _stat = status
+        def _disc_sent(ok, msg, _mic=_mic, _deaf=_deaf, _stat=_stat):
+            if ok:
+                self._set_status(f"Discord sent ✓  mic={_mic} deaf={_deaf} status={_stat}")
+            else:
+                self._set_status(f"Discord send failed: {msg}")
+        send_pixel_animation([frame], fps=self._fps, priority=PRIO_DISCORD,
+                             on_complete=_disc_sent)
+        self._set_status(f"Discord sending  mic={_mic} deaf={_deaf} status={_stat}")
 
     def _update_disc_preview(self, frame, key, mic_muted, status, deafened):
         """Update Discord tab preview widget."""
@@ -1794,8 +1940,7 @@ class DP104App:
                 try: temp_f = int(self.temp_ovr_var.get())
                 except: pass
             wind = self.debug_wind_var.get()
-            import dp104_weather_v2 as _WX
-            frames = _WX.build_frames(code, temp_f, high_f, low_f, wind)
+            frames = _WX_MOD.build_frames(code, temp_f, high_f, low_f, wind)
             self._wx_frames  = frames
             self._prev_idx   = 0
             n = len(frames)
@@ -2010,8 +2155,12 @@ class DP104App:
         src     = self._debug_np_src.get()
         playing = self._debug_np_playing.get()
         frames  = _NP_MOD.build_frames(src, playing)
-        send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP)
-        self._set_status(f"Debug NP sent: {src} {'playing' if playing else 'paused'}")
+        _lbl = f"{src} {'playing' if playing else 'paused'}"
+        send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP,
+                             on_complete=lambda ok,msg,l=_lbl:
+                                 self._set_status(f"Debug NP sent ✓  {l}" if ok
+                                                  else f"Debug NP failed: {msg}"))
+        self._set_status(f"Debug NP sending  {_lbl}")
 
     def _debug_preview_disc(self):
         """Preview Discord skin key in the Discord tab preview."""
@@ -2039,8 +2188,11 @@ class DP104App:
         key  = raw.split(' — ')[0].strip()
         frame = skin.get(key) if skin else None
         if frame:
-            send_pixel_animation([frame], fps=self._fps, priority=PRIO_DISCORD)
-            self._set_status(f"Discord skin sent: {key}")
+            send_pixel_animation([frame], fps=self._fps, priority=PRIO_DISCORD,
+                                 on_complete=lambda ok,msg,k=key:
+                                     self._set_status(f"Discord skin sent ✓  {k}" if ok
+                                                      else f"Discord skin failed: {msg}"))
+            self._set_status(f"Discord skin sending  {key}")
         else:
             self._set_status(f"No skin frame for '{key}' — skin not loaded")
 
@@ -2104,8 +2256,6 @@ class DP104App:
     def run(self):
         self.root.mainloop()
 
-
-APP_VERSION = "1.2.5"
 
 
 if __name__ == '__main__':
