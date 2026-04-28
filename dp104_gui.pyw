@@ -30,18 +30,36 @@ try:
     import tkinter as tk
     from tkinter import ttk
 except ImportError:
-    sys.exit("tkinter not available")
+    import ctypes
+    ctypes.windll.user32.MessageBoxW(0, "tkinter not available. Reinstall Python with tkinter.", "DP-104 Error", 0x10)
+    sys.exit(1)
+
+def _report_callback_error(exc, val, tb):
+    """Show full traceback in a message box instead of swallowing it."""
+    import traceback as _tb
+    msg = "".join(_tb.format_exception(exc, val, tb))
+    print(f"[DP-104 ERROR]\n{msg}", file=sys.stderr)
+    try:
+        import tkinter.messagebox as _mb
+        _mb.showerror("DP-104 Error", msg[:1000])
+    except Exception:
+        pass
 
 try:
     import pystray
     from pystray import MenuItem, Menu
 except ImportError:
-    sys.exit("pip install pystray")
+    # pystray optional — disable tray if missing
+    pystray = None
+    MenuItem = None
+    Menu = None
 
 try:
     from PIL import Image, ImageDraw
 except ImportError:
-    sys.exit("pip install pillow")
+    # PIL optional — disable tray icon if missing
+    Image = None
+    ImageDraw = None
 
 # ── HID ───────────────────────────────────────────────────────────────────────
 _hid = None
@@ -54,12 +72,104 @@ for _name in ('hid', 'hidapi'):
         continue
 
 RAW_USAGE_PAGE   = 0xFF60
+
+# ── Pixel send priority queue ─────────────────────────────────────────────────
+# Priorities: lower number = higher priority
+PRIO_DISCORD = 1   # Discord VC skin — highest priority
+PRIO_NP      = 2   # Now Playing custom pixel page
+PRIO_WEATHER = 3   # Weather animation — lowest priority
+
+def _send_direct(frames, fps=10, retries=3, retry_delay=2.0):
+    """Execute a pixel send synchronously. Called only from _PixelQueue worker."""
+    if not _hid: return False, "HID library not available"
+    last_err = "Unknown error"
+    for attempt in range(1, retries + 1):
+        dev = _hid.device()
+        opened = False
+        try:
+            dev.open_path(DP104_PIXEL_PATH)
+            dev.set_nonblocking(False)
+            opened = True
+        except Exception:
+            pass
+        if not opened:
+            info = find_dp104()
+            if not info:
+                last_err = "Keyboard not found"
+                time.sleep(retry_delay)
+                continue
+            try:
+                dev.open_path(info['path'])
+                dev.set_nonblocking(False)
+                opened = True
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(retry_delay)
+                continue
+        try:
+            send_pixel_frames(dev, frames, fps)
+            dev.close()
+            return True, "OK"
+        except Exception as e:
+            last_err = str(e)
+            try: dev.close()
+            except: pass
+            if attempt < retries:
+                time.sleep(retry_delay)  # wait before retry
+
+    return False, f"Failed after {retries} attempts: {last_err}"
+
+
+class _PixelQueue:
+    """Single-worker priority queue for keyboard pixel sends.
+    Highest-priority pending send wins. 4-second cooldown between sends
+    gives the keyboard time to reload its animation buffer."""
+    COOLDOWN = 4.0   # seconds between sends
+
+    def __init__(self):
+        self._lock    = threading.Lock()
+        self._event   = threading.Event()
+        self._pending = {}   # priority -> (frames, fps)
+        self._running = True
+        t = threading.Thread(target=self._worker, daemon=True)
+        t.start()
+
+    def submit(self, priority, frames, fps):
+        """Queue a send. Drops any pending send of same or lower priority."""
+        with self._lock:
+            # Discard lower-priority queued sends (higher prio_number = lower prio)
+            stale = [p for p in self._pending if p >= priority]
+            for p in stale:
+                del self._pending[p]
+            self._pending[priority] = (list(frames), fps)
+        self._event.set()
+
+    def _worker(self):
+        while self._running:
+            self._event.wait()
+            self._event.clear()
+            with self._lock:
+                if not self._pending:
+                    continue
+                best = min(self._pending)
+                frames, fps = self._pending.pop(best)
+            # Execute — direct call bypasses the queue (we're already serialized)
+            _send_direct(frames, fps)
+            # Cooldown gives keyboard time to reload animation buffer
+            time.sleep(self.COOLDOWN)
+            # If more work arrived during cooldown, wake up
+            if self._pending:
+                self._event.set()
+
+_PIXEL_QUEUE = _PixelQueue()
 DP104_VID        = 0xe560
 DP104_PID        = 0xe104
 DP104_PIXEL_PATH = b'\\\\?\\HID#VID_E560&PID_E104&MI_01#7&180b41ba&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}'
 MAX_TEXT_LEN     = 30
 PIXEL_W, PIXEL_H = 24, 8
 FRAME_BYTES      = PIXEL_W * PIXEL_H * 3
+
+APP_VERSION = "1.2.5"
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 BG   = '#0b0c14'   # near-black background
@@ -144,6 +254,14 @@ def send_pixel_frames(dev, frames, fps=10):
         if fi < n - 1:
             time.sleep(0.320)
 
+# ── Public pixel send API (routes through priority queue) ─────────────────────
+def send_pixel_animation(frames, fps=10, priority=PRIO_WEATHER):
+    """Submit a pixel animation to the priority queue.
+    priority: PRIO_DISCORD(1), PRIO_NP(2), or PRIO_WEATHER(3).
+    Returns immediately — actual send happens in queue worker with 4s cooldown."""
+    _PIXEL_QUEUE.submit(priority, frames, fps)
+    return True, "queued"
+
 # ── HID helpers ───────────────────────────────────────────────────────────────
 def find_dp104():
     if not _hid: return None
@@ -176,48 +294,6 @@ def send_to_keyboard(title, artist):
         return True
     except Exception:
         return False
-
-def send_pixel_animation(frames, fps=10, retries=3, retry_delay=2.0):
-    """Open keyboard on MI_01 interface and send pixel frames.
-    Retries up to `retries` times on disconnect. Call from background thread."""
-    if not _hid: return False, "HID library not available"
-
-    last_err = "Unknown error"
-    for attempt in range(1, retries + 1):
-        dev = _hid.device()
-        opened = False
-        try:
-            dev.open_path(DP104_PIXEL_PATH)
-            dev.set_nonblocking(False)
-            opened = True
-        except Exception:
-            pass
-        if not opened:
-            info = find_dp104()
-            if not info:
-                last_err = "Keyboard not found"
-                time.sleep(retry_delay)
-                continue
-            try:
-                dev.open_path(info['path'])
-                dev.set_nonblocking(False)
-                opened = True
-            except Exception as e:
-                last_err = str(e)
-                time.sleep(retry_delay)
-                continue
-        try:
-            send_pixel_frames(dev, frames, fps)
-            dev.close()
-            return True, "OK"
-        except Exception as e:
-            last_err = str(e)
-            try: dev.close()
-            except: pass
-            if attempt < retries:
-                time.sleep(retry_delay)  # wait before retry
-
-    return False, f"Failed after {retries} attempts: {last_err}"
 
 # ── Weather module loader ─────────────────────────────────────────────────────
 def _load_weather_mod():
@@ -410,7 +486,7 @@ $r = $results | Where-Object {$_.App -eq 'Spotify.exe' -and $_.Artist} | Select-
 if (-not $r) { $r = $results | Where-Object {$_.App -eq 'Spotify.exe'} | Select-Object -First 1 }
 if (-not $r) { $r = $results | Where-Object {$_.Artist} | Select-Object -First 1 }
 if (-not $r) { $r = $results | Select-Object -First 1 }
-if ($r) { Write-Output ($r.Title + "|" + $r.Artist) }
+if ($r) { Write-Output ($r.Title + "|" + $r.Artist + "|" + $r.App) }
 """
         result = subprocess.run(['powershell','-NoProfile','-NonInteractive','-Command',ps],
                                 capture_output=True, text=True, timeout=8,
@@ -418,13 +494,50 @@ if ($r) { Write-Output ($r.Title + "|" + $r.Artist) }
         lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
         out = lines[-1] if lines else ''
         if out and '|' in out:
-            t, a = out.split('|', 1)
-            if t.strip(): return (t.strip(), a.strip())
+            parts = out.split('|')
+            t   = parts[0].strip()
+            a   = parts[1].strip() if len(parts) > 1 else ''
+            app = parts[2].strip() if len(parts) > 2 else ''
+            if t: return (t, a, app)
     except Exception:
         pass
     return None
 
-# ── Windows toast notification ────────────────────────────────────────────────
+# ── Page switch command ───────────────────────────────────────────────────────
+PAGE_OFF    = 0   # blank display
+PAGE_CUSTOM = 2   # custom pixel animation (weather / discord / NP)
+PAGE_SCROLL = 6   # scrolling text (NP)
+
+def switch_page(dev, page):
+    """Switch keyboard display page. Send two HID packets.
+    page: PAGE_OFF(0), PAGE_CUSTOM(2), PAGE_SCROLL(6)"""
+    # Packet 1: [0x07, 0x1a, 0x02, page, 0x00 ...]
+    pkt1 = [0x00, 0x07, 0x1a, 0x02, page] + [0x00]*27
+    dev.write(pkt1[:33])
+    import time; time.sleep(0.05)
+    # Packet 2: [0x09, 0x1a, 0x00 ...]
+    pkt2 = [0x00, 0x09, 0x1a, 0x00] + [0x00]*29
+    dev.write(pkt2[:33])
+
+def switch_page_safe(page):
+    """Open keyboard, switch page, close. Safe to call from any thread."""
+    if not _hid: return
+    dev = _hid.device()
+    try:
+        try:
+            dev.open_path(DP104_PIXEL_PATH)
+        except Exception:
+            info = find_dp104()
+            if not info: return
+            dev.open_path(info['path'])
+        dev.set_nonblocking(False)
+        switch_page(dev, page)
+        dev.close()
+    except Exception as e:
+        try: dev.close()
+        except: pass
+
+# ── Windows toast notification ─────────────────────────────────────────────────
 def _toast_weather(data):
     """Show a Windows toast notification for a successful weather update.
     Only fires when called — never on NP updates, never if nothing changed."""
@@ -463,6 +576,8 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
 
 # ── Tray icon ─────────────────────────────────────────────────────────────────
 def make_tray_icon(connected=True):
+    if not Image or not ImageDraw:
+        return None
     img = Image.new('RGBA', (64,64), (0,0,0,0))
     d = ImageDraw.Draw(img)
     color = '#00e5a0' if connected else '#555555'
@@ -561,11 +676,17 @@ class DP104App:
 
         self.root = tk.Tk()
         self.root.title("DP-104 Controller")
+        self.root.report_callback_exception = _report_callback_error
         self.root.resizable(True, True)
         self.root.minsize(480, 540)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
-        self.root.bind("<Unmap>", self._on_minimize)
+        # <Unmap> fires during initial draw on Windows — guard with a flag
+        self._window_ready = False
+        def _on_unmap(e):
+            if self._window_ready and e.widget is self.root:
+                self._on_minimize()
+        self.root.bind("<Unmap>", _on_unmap)
         self.root.bind("<grave>", lambda e: self._open_debug())   # tilde/backtick key
         self.root.bind("<F1>",    lambda e: self._open_credits())  # F1 = credits
         self._debug_win = None
@@ -573,6 +694,10 @@ class DP104App:
         self.temp_ovr_var     = tk.StringVar(value='')
         self.temp_ovr_enabled = tk.BooleanVar(value=False)
         self.debug_wx_var     = tk.IntVar(value=-1)   # -1 = use live weather code
+        self._debug_np_src    = tk.StringVar(value='default')
+        self._debug_np_playing= tk.BooleanVar(value=True)
+        self._debug_np_eq     = tk.BooleanVar(value=True)
+        self._debug_disc_key  = tk.StringVar(value='ggg')
         self.debug_wind_var   = tk.IntVar(value=0)    # wind override for debug
         # These are created in _build_ui; pre-declare so _load_settings can set them
         self.np_enabled         = None
@@ -596,6 +721,9 @@ class DP104App:
         self.toggle_running()
         self.root.after(2000, self._check_connection)
         self.root.after(400,  self._tick_preview)
+        self.root.after(1500, self._disc_autoconnect)  # auto-connect if saved creds
+        # Allow <Unmap> to work only after first draw completes
+        self.root.after(500, lambda: setattr(self, '_window_ready', True))
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -619,7 +747,7 @@ class DP104App:
             padx=8, pady=3, activebackground='#2a1218', activeforeground='#ff6e7d',
             command=self._stop_all)
         self.btn_stop.pack(side='right')
-        tk.Label(hdr, text="v1.2.0", font=('Consolas',7),
+        tk.Label(hdr, text=f"v{APP_VERSION}", font=('Consolas',7),
                  bg=BG, fg=DIM).pack(side='right', padx=(0,10))
 
         _divider(r, padx=14)
@@ -683,7 +811,7 @@ class DP104App:
                         self.wx_enabled and self.wx_enabled.get()):
                     threading.Thread(
                         target=lambda: send_pixel_animation(
-                            list(self._wx_frames), fps=self._fps),
+                            list(self._wx_frames), fps=self._fps, priority=PRIO_WEATHER),
                         daemon=True).start()
             self._set_status(
                 "NP: custom pixel display" if self._np_custom else "NP: text scroll only")
@@ -875,12 +1003,39 @@ class DP104App:
                            selectcolor=BG3, activebackground=BG2,
                            activeforeground=FG, cursor='hand2').pack(side='left', padx=(8,0))
 
+        # Auto-connect checkbox
+        auto_row = tk.Frame(self.disc_panel, bg=BG2)
+        auto_row.pack(fill='x', pady=(6,0))
+        self.disc_autoconnect_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(auto_row, text="Auto-connect on startup",
+                       variable=self.disc_autoconnect_var,
+                       font=('Consolas',8), bg=BG2, fg=DIM,
+                       selectcolor=BG3, activebackground=BG2,
+                       activeforeground=FG, cursor='hand2').pack(side='left')
+
         # Info note
         _label(self.disc_panel,
                "ℹ  Mic + deafen read automatically.  "
                "Status must be set manually — Discord local IPC does not expose "
                "presence without OAuth2.",
-               font=('Consolas',7), fg=DIM).pack(anchor='w', pady=(6,0))
+               font=('Consolas',7), fg=DIM).pack(anchor='w', pady=(4,0))
+
+        # ── Now Playing on Discord tab ─────────────────────────────────────
+        _divider(self.disc_panel, pady=(10,6))
+        _label(self.disc_panel, "NOW PLAYING").pack(anchor='w', pady=(0,4))
+
+        self.lbl_disc_np_title = tk.Label(self.disc_panel, text="—",
+                                           font=('Consolas',10,'bold'),
+                                           bg='#06060f', fg=ACC,
+                                           anchor='w', padx=8, pady=4,
+                                           wraplength=440, justify='left')
+        self.lbl_disc_np_title.pack(fill='x', pady=(0,2))
+        self.lbl_disc_np_artist = tk.Label(self.disc_panel, text="",
+                                            font=('Consolas',9),
+                                            bg='#06060f', fg='#80ffcc',
+                                            anchor='w', padx=8, pady=4,
+                                            wraplength=440, justify='left')
+        self.lbl_disc_np_artist.pack(fill='x')
 
         # ── Status bar ────────────────────────────────────────────────────────
         _divider(r, padx=14, pady=(6,0))
@@ -1030,6 +1185,9 @@ class DP104App:
 
     # ── Tray ──────────────────────────────────────────────────────────────────
     def _build_tray(self):
+        if not pystray or not Image:
+            self.tray = None
+            return
         self.tray = pystray.Icon(
             "dp104", make_tray_icon(False), "DP-104 Controller",
             menu=Menu(
@@ -1084,7 +1242,10 @@ class DP104App:
         Both NP and Weather run concurrently regardless of active tab.
         NP text protocol and weather pixel protocol use separate keyboard pages.
         """
-        wx_countdown = 0
+        # Start countdown at interval so weather doesn't fire on very first tick.
+        # Settings may not be fully loaded yet when the thread starts.
+        try:    wx_countdown = int(self.wx_int_var.get()) * 60
+        except: wx_countdown = 240 * 60
         wx_fetching  = False
         np_fetching  = False
 
@@ -1100,7 +1261,7 @@ class DP104App:
                         try:
                             result = get_now_playing()
                             if result:
-                                title, artist = result
+                                title, artist, app_id = result
                                 if (title, artist) != self.last_np:
                                     # Always send text scroll first
                                     send_to_keyboard(title, artist)
@@ -1110,13 +1271,18 @@ class DP104App:
                                     # If custom NP enabled and not Discord in VC, send pixel page
                                     if (self._np_custom and _NP_MOD and
                                             not self._discord_in_vc):
-                                        src = _NP_MOD.get_source(title)
-                                        self.last_np_source = src
+                                        src    = _NP_MOD.get_source(app_id)
                                         frames = _NP_MOD.build_frames(src, True)
-                                        self._np_frames = frames
-                                        send_pixel_animation(frames, fps=self._fps)
-                                    if self.mode == 'nowplaying':
-                                        self._set_status("Now Playing updated")
+                                        self.last_np_source  = src
+                                        self._np_frames      = frames
+                                        self._np_prev_idx    = 0
+                                        send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP)
+                                        if self.mode == 'nowplaying':
+                                            self._set_status(
+                                                f"Now Playing updated  [{src}]")
+                                    else:
+                                        if self.mode == 'nowplaying':
+                                            self._set_status("Now Playing updated (text only)")
                             else:
                                 if self.last_np != (None, None):
                                     send_to_keyboard('', '')
@@ -1131,7 +1297,7 @@ class DP104App:
                                             self.wx_enabled.get()):
                                         threading.Thread(
                                             target=lambda: send_pixel_animation(
-                                                list(self._wx_frames), fps=self._fps),
+                                                list(self._wx_frames), fps=self._fps, priority=PRIO_WEATHER),
                                             daemon=True).start()
                         finally:
                             np_fetching = False
@@ -1190,10 +1356,15 @@ class DP104App:
         def _do():
             result = get_now_playing()
             if result:
-                title, artist = result
+                title, artist, app_id = result
                 send_to_keyboard(title, artist)
                 self.last_np = (title, artist)
                 self.root.after(0, self._update_np_display, title, artist)
+                if self._np_custom and _NP_MOD and not self._discord_in_vc:
+                    src    = _NP_MOD.get_source(app_id)
+                    frames = _NP_MOD.build_frames(src, True)
+                    self._np_frames = frames
+                    send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP)
             self._do_fetch_weather()
         threading.Thread(target=_do, daemon=True).start()
 
@@ -1202,11 +1373,16 @@ class DP104App:
             if self.mode == 'nowplaying':
                 result = get_now_playing()
                 if result:
-                    title, artist = result
+                    title, artist, app_id = result
                     ok = send_to_keyboard(title, artist)
                     if ok:
                         self.last_np = (title, artist)
                         self.root.after(0, self._update_np_display, title, artist)
+                        if self._np_custom and _NP_MOD and not self._discord_in_vc:
+                            src    = _NP_MOD.get_source(app_id)
+                            frames = _NP_MOD.build_frames(src, True)
+                            self._np_frames = frames
+                            send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP)
                         self._set_status("Sent")
                     else:
                         self._set_status("Send failed")
@@ -1221,245 +1397,114 @@ class DP104App:
             send_to_keyboard('', '')
             self.last_np = (None, None)
             self._wx_frames = []
+            self._np_frames = []
             self._wx_sending = False
+            switch_page_safe(PAGE_OFF)   # actually blank the keyboard display
             self.root.after(0, self._update_np_display, '', '')
             self.root.after(0, self.lbl_frame.config, {'text': ''})
-            self._set_status("Cleared")
         threading.Thread(target=_do, daemon=True).start()
+        self._set_status("Cleared")
 
+
+    # ── Now Playing display updater ───────────────────────────────────────────
+    def _update_np_display(self, title, artist):
+        """Update all Now Playing label widgets."""
+        self.lbl_title.config(text=title or '—')
+        self.lbl_artist.config(text=artist or '')
+        self.lbl_kb0.config(text=sanitize(title)[:MAX_TEXT_LEN] if title else '')
+        self.lbl_kb1.config(text=sanitize(artist)[:MAX_TEXT_LEN] if artist else '')
+        if hasattr(self, 'lbl_wx_np_title'):
+            self.lbl_wx_np_title.config(text=title or '—')
+        if hasattr(self, 'lbl_wx_np_artist'):
+            self.lbl_wx_np_artist.config(text=artist or '')
+        if hasattr(self, 'lbl_disc_np_title'):
+            self.lbl_disc_np_title.config(text=title or '—')
+        if hasattr(self, 'lbl_disc_np_artist'):
+            self.lbl_disc_np_artist.config(text=artist or '')
+        if self.tray and title:
+            self.tray.title = title[:30]
+
+    # ── Weather fetch ─────────────────────────────────────────────────────────
     def _fetch_weather(self):
+        """Button handler — launches weather fetch in background thread."""
         threading.Thread(target=self._do_fetch_weather, daemon=True).start()
 
     def _do_fetch_weather(self):
-        # Guard with a timeout — auto-release after 120s to prevent permanent lock
+        """Fetch weather data, build animation frames, submit to pixel queue."""
+        # Hard gate: never run if weather disabled
+        if self.wx_enabled and not self.wx_enabled.get():
+            return
         if self._wx_sending:
             if time.time() - getattr(self, '_wx_send_start', 0) < 120:
                 self._set_status("Already sending, please wait...")
                 return
             else:
-                self._wx_sending = False  # timed out — release the lock
+                self._wx_sending = False
 
         self._wx_sending = True
         self._wx_send_start = time.time()
-
         loc = self.loc_var.get().strip() or "03275"
-        self._set_status(f"Fetching weather for {loc}...")
-        self.root.after(0, self.lbl_weather.config,
-                        {'text': f"Fetching {loc}...", 'fg': DIM})
+
         try:
-            data = fetch_weather(loc)
+            # Resolve zip → city if needed
+            import dp104_weather_v2 as _WX
+            data = _WX.fetch_weather(loc)
         except Exception as e:
-            self.root.after(0, self.lbl_weather.config,
-                            {'text': f"Fetch error: {e}", 'fg': RED})
-            self._set_status("Weather fetch failed")
             self._wx_sending = False
+            self._set_status(f"Weather fetch failed: {e}")
             return
 
         if not data:
-            self.root.after(0, self.lbl_weather.config,
-                            {'text': "Failed to fetch weather.", 'fg': RED})
-            self._set_status("Weather fetch failed")
             self._wx_sending = False
+            self._set_status("Weather: no data returned")
             return
 
-        # Apply temperature override if enabled
-        if getattr(self, 'temp_ovr_enabled', None) and self.temp_ovr_enabled.get():
-            try:
-                data['temp'] = str(int(self.temp_ovr_var.get()))
-            except (ValueError, AttributeError):
-                pass  # invalid entry — use real temp
+        # Store for debug menu
+        self._last_wx_data = data
 
-        display_name = data.get('display_name', loc)
-        day_night = "Day" if data.get('is_day', True) else "Night"
-        summary = (f"{display_name}  —  {data['cond']}  {data['temp']}°F  "
-                   f"H:{data['high']}  L:{data['low']}  "
-                   f"Wind {data['wind']}mph {data['wdir']}  [{day_night}]")
-        self.root.after(0, self.lbl_weather.config, {'text': summary, 'fg': ACC})
+        # Debug overrides
+        try:
+            code = self.debug_wx_var.get()
+            temp_f = int(data.get('temp', 72))
+            high_f = int(data.get('high', 85))
+            low_f  = int(data.get('low',  58))
+            wind   = int(data.get('wind',  0))
+            if self.temp_ovr_enabled.get():
+                try: temp_f = int(self.temp_ovr_var.get())
+                except: pass
+            if hasattr(self, 'debug_wind_var'):
+                wind = self.debug_wind_var.get()
+            import dp104_weather_v2 as _WX2
+            if code == -1:
+                frames = _WX2.build_frames(data['code'], temp_f, high_f, low_f, wind)
+            else:
+                frames = _WX2.build_frames(code, temp_f, high_f, low_f, wind)
+        except Exception as e:
+            self._wx_sending = False
+            self._set_status(f"Weather build failed: {e}")
+            return
 
-        self._last_wx_data = data   # cache for debug menu
-        # Apply debug animation override if set
-        dbg_code = getattr(self, 'debug_wx_var', None)
-        if dbg_code and dbg_code.get() >= 0 and _WX_MOD:
-            try:
-                t  = int(data.get('temp', 72))
-                h2 = int(data.get('high', 85))
-                l2 = int(data.get('low',  58))
-                w2 = int(data.get('wind',  0))
-                frames = _WX_MOD.build_frames(dbg_code.get(), t, h2, l2, w2)
-            except Exception:
-                frames = build_weather_frames(data)
-        else:
-            frames = build_weather_frames(data)
         self._wx_frames = frames
-        # Priority check: Discord VC or NP custom page takes over the pixel page.
-        # In those cases, update preview + cache frames but don't send to keyboard.
-        np_custom_active = (self._np_custom and
-                            bool(self._np_frames) and
-                            self.last_np != (None, None))
-        should_send = not self._discord_in_vc and not np_custom_active
+        self._prev_idx  = 0
 
-        if should_send:
-            self._set_status("Sending to keyboard...")
-            time.sleep(0.1)
-            ok, msg = send_pixel_animation(frames, fps=self._fps)
-        else:
-            ok  = True
-            msg = "queued"
-            reason = "Discord VC active" if self._discord_in_vc else "NP custom active"
-            self._set_status(f"Weather cached ({reason})")
+        # Update the weather panel display
+        self.root.after(0, self.lbl_wx_temp.config,
+                        {'text': f"{data.get('temp','?')}°F"})
+        self.root.after(0, self.lbl_wx_cond.config,
+                        {'text': data.get('cond', '')[:32]})
+
+        # Submit to priority queue — Discord/NP at higher priority will win
+        send_pixel_animation(frames, fps=self._fps, priority=PRIO_WEATHER)
 
         self._wx_sending = False
-
         ts = time.strftime('%m/%d/%y %H:%M:%S')
         self.root.after(0, self.lbl_wx_updated.config,
-                        {'text': f"Last updated: {ts} {'(queued)' if not should_send else ''}",
-                         'fg': ACC2 if should_send else DIM})
-        if should_send:
-            if ok:
-                self._set_status(
-                    f"Weather sent  ·  {data['temp']}°F  {data['cond'][:28]}")
-                _toast_weather(data)
-            else:
-                self._set_status(f"Send failed: {msg}")
+                        {'text': f"Last updated: {ts}", 'fg': ACC2})
+        self._set_status(f"Weather queued  ·  {data.get('temp','?')}°F  "
+                         f"{data.get('cond','')[:28]}")
+        _toast_weather(data)
 
-    def _update_np_display(self, title, artist):
-        self.lbl_title.config(text=title or '—')
-        self.lbl_artist.config(text=artist or '')
-        self.lbl_kb0.config(text=sanitize(title)[:MAX_TEXT_LEN] if title else '')
-        self.lbl_kb1.config(text=sanitize(artist)[:MAX_TEXT_LEN] if artist else '')
-        self.lbl_wx_np_title.config(text=title or '—')
-        self.lbl_wx_np_artist.config(text=artist or '')
-        if self.tray and title:
-            self.tray.title = title[:30]
-
-    # ── Discord methods ───────────────────────────────────────────────────────
-    def _disc_connect(self):
-        """Start Discord IPC connection."""
-        if not _DISC_MOD:
-            self._set_status("dp104_discord.py not found in same folder")
-            return
-        cid = self.disc_cid_var.get().strip()
-        if not cid:
-            self._set_status("Enter a Discord Client ID first")
-            return
-        sec = self.disc_csec_var.get().strip() or None
-        self.root.after(0, self.lbl_disc_status.config,
-                        {'text': '● Connecting...', 'fg': ORG})
-        def _run():
-            try:
-                self._discord_display = _DISC_MOD.DiscordDisplay(
-                    client_id=cid,
-                    client_secret=sec,
-                    skin_dir=str(Path(__file__).parent / 'skins' / 'default'),
-                    fps=self._fps,
-                )
-                self._discord_display._ipc.on_state_change = self._disc_on_state
-                # Patch VC detection into the IPC run loop via monkey-patch
-                self._discord_display.start()
-                self._discord_connected = True
-                self.root.after(0, self.lbl_disc_status.config,
-                                {'text': '● Connected', 'fg': ACC})
-                self.root.after(0, self.btn_disc_connect.config,
-                                {'text': 'Disconnect', 'command': self._disc_disconnect})
-                self.root.after(0, self._style_tabs)
-            except Exception as e:
-                self._discord_connected = False
-                self.root.after(0, self.lbl_disc_status.config,
-                                {'text': f'● Error: {str(e)[:40]}', 'fg': RED})
-        self._discord_thread = threading.Thread(target=_run, daemon=True)
-        self._discord_thread.start()
-
-    def _disc_disconnect(self):
-        """Stop Discord IPC."""
-        if self._discord_display:
-            try: self._discord_display.stop()
-            except: pass
-            self._discord_display = None
-        self._discord_connected = False
-        self._discord_in_vc     = False
-        self.root.after(0, self.lbl_disc_status.config,
-                        {'text': '● Disconnected', 'fg': RED})
-        self.root.after(0, self.btn_disc_connect.config,
-                        {'text': 'Connect', 'command': self._disc_connect})
-        self._style_tabs()
-
-    def _disc_set_status(self):
-        """Update online status from selector."""
-        status = self.disc_status_var.get()
-        if self._discord_display:
-            self._discord_display.set_status(status)
-        self._set_status(f"Discord status → {status}")
-
-    def _disc_on_state(self, mic_muted, status, deafened):
-        """Called by DiscordDisplay when mic/deafen/status changes."""        # If in VC (mic or deafen state received) — show Discord skin, pause weather
-        self._discord_in_vc = True   # any IPC state update = we're active
-        self.root.after(0, self._style_tabs)
-
-    def _disc_on_vc_leave(self):
-        """Called when user leaves VC — revert to fallback display."""
-        self._discord_in_vc = False
-        self.root.after(0, self._style_tabs)
-        fallback = self.disc_fallback_var.get() if hasattr(self, 'disc_fallback_var') else 'weather'
-        if fallback == 'weather' and self.wx_enabled and self.wx_enabled.get():
-            threading.Thread(target=self._do_fetch_weather, daemon=True).start()
-        elif fallback == 'nowplaying' and self._np_frames:
-            send_pixel_animation(list(self._np_frames), fps=self._fps)
-
-    def _on_temp_override_toggle(self):
-        """Enable/disable the temp override entry field."""
-        if self.temp_ovr_enabled.get():
-            self.temp_ovr_entry.config(state='normal')
-            self.temp_ovr_entry.focus_set()
-        else:
-            self.temp_ovr_entry.config(state='disabled')
-            self.temp_ovr_var.set('')
-
-    def _set_status(self, msg):
-        ts = time.strftime('%H:%M:%S')
-        self.root.after(0, self.lbl_status.config, {'text': f"{ts}  {msg}"})
-
-    # ── Quit ──────────────────────────────────────────────────────────────────
-    def _on_minimize(self, event):
-        """Minimize button in title bar -> go to tray."""
-        if event.widget is self.root and self.root.winfo_viewable():
-            self.minimize_to_tray()
-
-    def _load_settings(self):
-        """Load saved settings from JSON on startup."""
-        try:
-            if self._settings_path.exists():
-                s = json.loads(self._settings_path.read_text())
-                if 'location'    in s: self.loc_var.set(s['location'])
-                if 'poll_sec'    in s:
-                    self.interval_var.set(str(s['poll_sec']))
-                    try: self.interval = int(s['poll_sec'])
-                    except: pass
-                if 'wx_refresh'  in s: self.wx_int_var.set(str(s['wx_refresh']))
-                if 'fps'         in s:
-                    self.fps_var.set(str(s['fps']))
-                    self._fps = int(s['fps'])
-                if 'mode'        in s:
-                    self.mode_var.set(s['mode'])
-                    self.root.after(50, self._on_mode_change)
-                    self.root.after(60, self._style_tabs)
-                if 'np_enabled'  in s and self.np_enabled:
-                    self.np_enabled.set(bool(s['np_enabled']))
-                if 'wx_enabled'  in s and self.wx_enabled:
-                    self.wx_enabled.set(bool(s['wx_enabled']))
-                if 'disc_enabled' in s and self.discord_enabled:
-                    self.discord_enabled.set(bool(s['disc_enabled']))
-                if 'disc_client_id' in s and hasattr(self,'disc_cid_var'):
-                    self.disc_cid_var.set(s['disc_client_id'])
-                if 'disc_status' in s and hasattr(self,'disc_status_var'):
-                    self.disc_status_var.set(s['disc_status'])
-                if 'disc_fallback' in s and hasattr(self,'disc_fallback_var'):
-                    self.disc_fallback_var.set(s['disc_fallback'])
-                if 'np_custom' in s and hasattr(self,'_np_custom_var'):
-                    self._np_custom_var.set(bool(s['np_custom']))
-                    self._np_custom = bool(s['np_custom'])
-        except Exception:
-            pass  # silently ignore corrupt settings
-
+    # ── Settings ──────────────────────────────────────────────────────────────
     def _save_settings(self):
         """Persist settings to JSON on exit."""
         try:
@@ -1469,98 +1514,371 @@ class DP104App:
                 'wx_refresh':      self.wx_int_var.get(),
                 'fps':             self.fps_var.get(),
                 'mode':            self.mode_var.get(),
-                'np_enabled':      self.np_enabled.get()      if self.np_enabled      else True,
-                'wx_enabled':      self.wx_enabled.get()      if self.wx_enabled      else True,
-                'disc_enabled':    self.discord_enabled.get() if self.discord_enabled else False,
-                'disc_client_id':  self.disc_cid_var.get()    if hasattr(self,'disc_cid_var')  else '',
-                'disc_status':     self.disc_status_var.get() if hasattr(self,'disc_status_var') else 'online',
-                'disc_fallback':   self.disc_fallback_var.get() if hasattr(self,'disc_fallback_var') else 'weather',
-                'np_custom':       self._np_custom_var.get()  if hasattr(self,'_np_custom_var') else True,
+                'np_enabled':      self.np_enabled.get()       if self.np_enabled       else True,
+                'wx_enabled':      self.wx_enabled.get()       if self.wx_enabled       else True,
+                'disc_enabled':    self.discord_enabled.get()  if self.discord_enabled  else False,
+                'disc_client_id':  self.disc_cid_var.get()     if hasattr(self,'disc_cid_var')        else '',
+                'disc_status':     self.disc_status_var.get()  if hasattr(self,'disc_status_var')     else 'online',
+                'disc_fallback':   self.disc_fallback_var.get() if hasattr(self,'disc_fallback_var')  else 'weather',
+                'disc_autoconnect': self.disc_autoconnect_var.get() if hasattr(self,'disc_autoconnect_var') else False,
+                'np_custom':       self._np_custom_var.get()   if hasattr(self,'_np_custom_var')      else True,
             }
-            self._settings_path.write_text(json.dumps(s, indent=2))
+            cfg = Path(__file__).parent / 'dp104_settings.json'
+            cfg.write_text(json.dumps(s, indent=2))
         except Exception:
             pass
 
-    def _open_debug(self):
-        """Open the debug panel (tilde key). Attached to main window, not always-on-top."""
-        if self._debug_win and tk.Toplevel.winfo_exists(self._debug_win):
-            self._debug_win.lift()
-            self._debug_win.focus_force()
+    def _load_settings(self):
+        """Load settings from JSON if it exists."""
+        try:
+            cfg = Path(__file__).parent / 'dp104_settings.json'
+            if not cfg.exists():
+                return
+            s = json.loads(cfg.read_text())
+            if 'location'    in s: self.loc_var.set(s['location'])
+            if 'poll_sec'    in s: self.interval_var.set(s['poll_sec'])
+            if 'wx_refresh'  in s: self.wx_int_var.set(s['wx_refresh'])
+            if 'fps'         in s: self.fps_var.set(s['fps']); self._fps = int(s['fps'])
+            if 'mode' in s:
+                self.mode_var.set(s['mode'])
+                self.root.after(50, self._on_mode_change)
+                self.root.after(60, self._style_tabs)
+            if 'np_enabled'  in s and self.np_enabled:
+                self.np_enabled.set(bool(s['np_enabled']))
+            if 'wx_enabled'  in s and self.wx_enabled:
+                self.wx_enabled.set(bool(s['wx_enabled']))
+            if 'disc_enabled' in s and self.discord_enabled:
+                self.discord_enabled.set(bool(s['disc_enabled']))
+            if 'disc_client_id' in s and hasattr(self,'disc_cid_var'):
+                self.disc_cid_var.set(s['disc_client_id'])
+            if 'disc_status' in s and hasattr(self,'disc_status_var'):
+                self.disc_status_var.set(s['disc_status'])
+            if 'disc_fallback' in s and hasattr(self,'disc_fallback_var'):
+                self.disc_fallback_var.set(s['disc_fallback'])
+            if 'disc_autoconnect' in s and hasattr(self,'disc_autoconnect_var'):
+                self.disc_autoconnect_var.set(bool(s['disc_autoconnect']))
+            if 'np_custom' in s and hasattr(self,'_np_custom_var'):
+                self._np_custom_var.set(bool(s['np_custom']))
+                self._np_custom = bool(s['np_custom'])
+            self.root.after(10, self._style_tabs)
+        except Exception:
+            pass
+
+    # ── Status bar ────────────────────────────────────────────────────────────
+    _last_disc_ts = ""
+    _last_wx_ts   = ""
+    _last_np_ts   = ""
+
+    def _set_status(self, msg):
+        ts = time.strftime('%H:%M:%S')
+        if msg.startswith("Discord:") or msg.startswith("Discord "):
+            DP104App._last_disc_ts = ts
+        elif "Weather" in msg or "weather" in msg or "wx" in msg.lower():
+            DP104App._last_wx_ts = ts
+        elif "Now Playing" in msg or "NP " in msg:
+            DP104App._last_np_ts = ts
+        self.root.after(0, self._refresh_status_bar, ts, msg)
+
+    def _refresh_status_bar(self, ts, msg):
+        parts = [f"{ts}  {msg}"]
+        if DP104App._last_wx_ts:
+            parts.append(f"wx:{DP104App._last_wx_ts}")
+        if DP104App._last_np_ts:
+            parts.append(f"np:{DP104App._last_np_ts}")
+        if DP104App._last_disc_ts:
+            parts.append(f"disc:{DP104App._last_disc_ts}")
+        try:
+            self.lbl_status.config(text="  ·  ".join(parts))
+        except Exception:
+            pass
+
+    # ── Discord methods ───────────────────────────────────────────────────────
+    def _check_skin_folder(self):
+        """Warn if skins/default missing or incomplete."""
+        skin_dir = Path(__file__).parent / 'skins' / 'default'
+        if not skin_dir.exists():
+            self.lbl_skin_warn.config(
+                text=f"⚠ Skin folder not found: {skin_dir}\n"
+                     "Create skins\\default\\ and add the 12 PNG files "
+                     "(ggg.png … rrr.png) to use Discord VC display.")
             return
+        pngs = list(skin_dir.glob('*.png'))
+        if len(pngs) < 12:
+            self.lbl_skin_warn.config(
+                text=f"⚠ Only {len(pngs)}/12 PNG files in {skin_dir}. "
+                     "Some states may fall back to default skin.")
+        else:
+            self.lbl_skin_warn.config(text="")
+
+    def _disc_autoconnect(self):
+        """Auto-connect Discord on startup if enabled, creds saved, token cached."""
+        try:
+            cid       = self.disc_cid_var.get().strip()
+            disc_on   = self.discord_enabled and self.discord_enabled.get()
+            auto_on   = hasattr(self,'disc_autoconnect_var') and self.disc_autoconnect_var.get()
+            tok_path  = Path(__file__).parent / '.discord_token'
+            if disc_on and auto_on and cid and tok_path.exists() and not self._discord_connected:
+                self._set_status("Auto-connecting Discord...")
+                self._disc_connect()
+        except Exception:
+            pass
+
+    def _disc_connect(self):
+        """Start Discord IPC using DiscordIPC directly.
+        All skin sends go through _PIXEL_QUEUE — no parallel HID access."""
+        if not _DISC_MOD:
+            self._set_status("dp104_discord.py not found in same folder")
+            return
+        cid = self.disc_cid_var.get().strip()
+        if not cid:
+            self._set_status("Enter a Discord Client ID first")
+            return
+        sec = self.disc_csec_var.get().strip() or None
+
+        skin_dir = Path(__file__).parent / 'skins' / 'default'
+        try:
+            self._disc_skin = _DISC_MOD.load_skin(str(skin_dir))
+            print(f"[Discord GUI] Skin loaded: {len(self._disc_skin)} variants")
+        except Exception as e:
+            self._disc_skin = {}
+            print(f"[Discord GUI] Skin load failed: {e}")
+            self._set_status(f"Skin load failed: {e}")
+
+        self._discord_connected = True
+        self.root.after(0, self.lbl_disc_status.config,
+                        {'text': '● Connecting...', 'fg': ORG})
+        self.root.after(0, self.btn_disc_connect.config,
+                        {'text': 'Disconnect', 'command': self._disc_disconnect})
+
+        def _on_ipc_ready():
+            self.root.after(0, self.lbl_disc_status.config,
+                            {'text': '● Connected — waiting for VC state...', 'fg': ACC})
+            self.root.after(0, self._style_tabs)
+            print("[Discord GUI] Auth complete — poll loop active")
+
+        def _ipc_run():
+            retry = 5.0
+            while self._discord_connected:
+                try:
+                    print(f"[Discord GUI] Creating DiscordIPC (cid={cid[:8]}...)")
+                    self.root.after(0, self.lbl_disc_status.config,
+                                    {'text': '● Authenticating... (may take 15-20s)',
+                                     'fg': ORG})
+                    # After 30s still authenticating → show it's connected but verifying
+                    def _auth_timeout():
+                        try:
+                            cur = self.lbl_disc_status.cget('text')
+                            if 'Authenticating' in cur and self._discord_connected:
+                                self.lbl_disc_status.config(
+                                    text='● Connected (verifying...)', fg=ACC)
+                        except Exception: pass
+                    self.root.after(30000, _auth_timeout)
+                    ipc = _DISC_MOD.DiscordIPC(
+                        client_id=cid,
+                        client_secret=sec,
+                        on_state_change=self._disc_on_state,
+                        on_ready=_on_ipc_ready,
+                        on_vc_leave=self._disc_on_vc_leave,
+                    )
+                    self._discord_ipc = ipc
+                    print("[Discord GUI] IPC run() starting (auth may take 15-20s)...")
+                    ipc.run()
+                    print("[Discord GUI] IPC run() exited")
+                except Exception as e:
+                    print(f"[Discord GUI] IPC error: {e}")
+                    self.root.after(0, self.lbl_disc_status.config,
+                                    {'text': f'● {str(e)[:45]}', 'fg': RED})
+                if self._discord_connected:
+                    self.root.after(0, self.lbl_disc_status.config,
+                                    {'text': '● Reconnecting...', 'fg': ORG})
+                    time.sleep(retry)
+
+        self._discord_thread = threading.Thread(target=_ipc_run, daemon=True)
+        self._discord_thread.start()
+
+    def _disc_disconnect(self):
+        """Stop Discord IPC."""
+        self._discord_connected = False
+        ipc = getattr(self, '_discord_ipc', None)
+        if ipc:
+            try: ipc.stop()
+            except: pass
+            self._discord_ipc = None
+        self._discord_in_vc = False
+        self.root.after(0, self.lbl_disc_status.config,
+                        {'text': '● Disconnected', 'fg': RED})
+        self.root.after(0, self.btn_disc_connect.config,
+                        {'text': 'Connect', 'command': self._disc_connect})
+        self._style_tabs()
+
+    def _disc_set_status(self):
+        """Update online status from selector."""
+        status = self.disc_status_var.get()
+        ipc = getattr(self, '_discord_ipc', None)
+        if ipc:
+            ipc.set_status(status)
+        self._set_status(f"Discord status → {status}")
+
+    def _disc_on_state(self, mic_muted, status, deafened):
+        """Called by DiscordIPC on mic/deafen/status change. Queues skin frame."""
+        self._discord_in_vc = True
+        self.root.after(0, self._style_tabs)
+        skin = getattr(self, '_disc_skin', {})
+        if not skin:
+            print("[Discord GUI] No skin loaded — skipping send")
+            return
+        key   = _DISC_MOD.state_to_key(mic_muted, status, deafened)
+        frame = skin.get(key) or skin.get('ggg')
+        if not frame:
+            print(f"[Discord GUI] No frame for key '{key}' — skipping")
+            return
+        print(f"[Discord GUI] State → key={key}  queuing PRIO_DISCORD send")
+        self.root.after(0, self._update_disc_preview, frame, key,
+                        mic_muted, status, deafened)
+        send_pixel_animation([frame], fps=self._fps, priority=PRIO_DISCORD)
+        self._set_status(
+            f"Discord: mic={'muted' if mic_muted else 'live'} "
+            f"deaf={'yes' if deafened else 'no'} status={status}")
+
+    def _update_disc_preview(self, frame, key, mic_muted, status, deafened):
+        """Update Discord tab preview widget."""
+        try:
+            if hasattr(self, 'disc_preview'):
+                self.disc_preview.set_frame(frame)
+            if hasattr(self, 'lbl_disc_state'):
+                mic_s  = "🔴 muted" if mic_muted else "🟢 live"
+                deaf_s = "🔇 deaf"  if deafened  else "🔊 hearing"
+                st_s   = {'online':'🟢','away':'🟡','dnd':'🔴',
+                          'invisible':'⚫'}.get(status,'●') + ' ' + status
+                self.lbl_disc_state.config(
+                    text=f"{mic_s}  {deaf_s}  {st_s}  [{key}]")
+        except Exception:
+            pass
+
+    def _disc_on_vc_leave(self):
+        """Called when user leaves VC — revert to fallback display."""
+        self._discord_in_vc = False
+        self.root.after(0, self._style_tabs)
+        fb = self.disc_fallback_var.get() if hasattr(self,'disc_fallback_var') else 'weather'
+        if fb == 'weather' and self.wx_enabled and self.wx_enabled.get():
+            threading.Thread(target=self._do_fetch_weather, daemon=True).start()
+        elif fb == 'nowplaying' and self._np_frames:
+            send_pixel_animation(list(self._np_frames), fps=self._fps, priority=PRIO_NP)
+
+    # ── Temperature override ──────────────────────────────────────────────────
+    def _on_temp_override_toggle(self):
+        enabled = self.temp_ovr_enabled.get()
+        state = 'normal' if enabled else 'disabled'
+        if hasattr(self, 'temp_ovr_entry'):
+            self.temp_ovr_entry.config(state=state)
+
+    # ── Debug preview helpers ─────────────────────────────────────────────────
+    def _apply_debug_preview(self):
+        """Rebuild preview frames using debug overrides."""
+        code = self.debug_wx_var.get()
+        if code == -1:
+            return
+        try:
+            temp_f = 72; high_f = 85; low_f = 58; wind = 0
+            if hasattr(self, '_last_wx_data') and self._last_wx_data:
+                d = self._last_wx_data
+                try: temp_f = int(d.get('temp', 72))
+                except: pass
+                try: high_f = int(d.get('high', 85))
+                except: pass
+                try: low_f  = int(d.get('low',  58))
+                except: pass
+                try: wind   = int(d.get('wind',  0))
+                except: pass
+            if self.temp_ovr_enabled.get():
+                try: temp_f = int(self.temp_ovr_var.get())
+                except: pass
+            wind = self.debug_wind_var.get()
+            import dp104_weather_v2 as _WX
+            frames = _WX.build_frames(code, temp_f, high_f, low_f, wind)
+            self._wx_frames  = frames
+            self._prev_idx   = 0
+            n = len(frames)
+            fps = self._fps
+            self.root.after(0, self.lbl_frame.config,
+                            {'text': f"frame 1 / {n}"})
+        except Exception as e:
+            self._set_status(f"Debug preview error: {e}")
+
+    def _send_debug_animation(self):
+        """Send the currently previewed debug weather animation to keyboard."""
+        if not self._wx_frames:
+            self._set_status("No frames to send — pick an animation first")
+            return
+        frames = list(self._wx_frames)
+        fps    = self._fps
+        threading.Thread(
+            target=lambda: send_pixel_animation(frames, fps=fps, priority=PRIO_WEATHER),
+            daemon=True).start()
+        self._set_status(f"Debug animation sent ({len(frames)} frames)")
+
+    # ── Debug window ──────────────────────────────────────────────────────────
+    def _open_debug(self):
+        """Open the debug panel (tilde key)."""
+        if self._debug_win and tk.Toplevel.winfo_exists(self._debug_win):
+            self._debug_win.lift(); self._debug_win.focus_force(); return
 
         win = tk.Toplevel(self.root)
-        win.title("Debug  —  DP-104  v1.2.0")
+        win.title(f"Debug  —  DP-104  v{APP_VERSION}")
         win.configure(bg=BG)
         win.resizable(False, False)
-        win.transient(self.root)          # attached to parent: hides with it, no always-on-top
+        win.transient(self.root)
         win.bind("<grave>", lambda e: win.destroy())
         win.bind("<F1>",    lambda e: self._open_credits())
         self._debug_win = win
 
-        # Position snapped to right edge of main window
         def _reposition(*_):
             if not tk.Toplevel.winfo_exists(win): return
             self.root.update_idletasks()
             rx = self.root.winfo_x() + self.root.winfo_width() + 8
             ry = self.root.winfo_y()
             win.geometry(f"+{rx}+{ry}")
-
         _reposition()
-        # Track main window moves and snap debug alongside
         self.root.bind("<Configure>", _reposition, add='+')
         win.protocol("WM_DELETE_WINDOW",
                      lambda: [self.root.unbind("<Configure>"), win.destroy()])
 
-        # ── Header ─────────────────────────────────────────────────────────────
         tk.Label(win, text="  ⚙  DEBUG MENU",
                  font=('Consolas',11,'bold'), bg=BG, fg=ORG,
                  pady=10, padx=14).pack(anchor='w')
         tk.Frame(win, bg=SEP, height=1).pack(fill='x', padx=14)
 
-        # ── Weather animation override ─────────────────────────────────────────
-        wx_card = _card(win)
-        wx_card.pack(fill='x', padx=14, pady=(10,0))
-        _label(wx_card, "FORCE WEATHER ANIMATION", fg=ORG).pack(anchor='w', pady=(0,8))
+        # ── Tabs ──────────────────────────────────────────────────────────────
+        nb = ttk.Notebook(win)
+        nb.pack(fill='both', expand=True, padx=14, pady=10)
 
-        WEATHER_NAMES = [
-            (0, "0 — Sunny"),
-            (1, "1 — Partly Cloudy"),
-            (2, "2 — Cloudy (House)"),
-            (3, "3 — Rainy"),
-            (4, "4 — Snowy"),
-            (5, "5 — Thunderstorm"),
-            (6, "6 — Night Clear"),
-            (7, "7 — Night Partly Cloudy"),
-        ]
+        # ── Weather tab ────────────────────────────────────────────────────────
+        wx_tab = tk.Frame(nb, bg=BG2); nb.add(wx_tab, text=" ⛅ Weather ")
+
+        _label(wx_tab, "FORCE ANIMATION", fg=ORG).pack(anchor='w', pady=(8,4), padx=10)
+        WEATHER_NAMES = [(0,"0 — Sunny"),(1,"1 — Partly Cloudy"),(2,"2 — Cloudy (House)"),
+                         (3,"3 — Rainy"),(4,"4 — Snowy"),(5,"5 — Thunderstorm"),
+                         (6,"6 — Night Clear"),(7,"7 — Night Partly Cloudy")]
         self.debug_wx_var.set(-1)
-        tk.Radiobutton(wx_card, text="—  Live (from weather API)",
+        f_wx = tk.Frame(wx_tab, bg=BG2); f_wx.pack(fill='x', padx=10)
+        tk.Radiobutton(f_wx, text="—  Live (weather API)",
                        variable=self.debug_wx_var, value=-1,
-                       font=('Consolas',9), fg=FG, bg=BG2,
-                       selectcolor=BG3, activebackground=BG2,
-                       activeforeground=ACC, indicatoron=0,
-                       width=26, pady=4, relief='flat', cursor='hand2',
-                       command=self._apply_debug_preview).pack(fill='x', pady=1)
-        for code, label in WEATHER_NAMES:
-            tk.Radiobutton(wx_card, text=label,
-                           variable=self.debug_wx_var, value=code,
-                           font=('Consolas',9), fg=FG, bg=BG2,
-                           selectcolor=BG3, activebackground=BG2,
-                           activeforeground=ACC, indicatoron=0,
-                           width=26, pady=4, relief='flat', cursor='hand2',
-                           command=self._apply_debug_preview).pack(fill='x', pady=1)
+                       font=('Consolas',9), fg=FG, bg=BG2, selectcolor=BG3,
+                       activebackground=BG2, activeforeground=ACC,
+                       indicatoron=0, width=26, pady=3, relief='flat',
+                       cursor='hand2', command=self._apply_debug_preview).pack(fill='x', pady=1)
+        for code, lbl in WEATHER_NAMES:
+            tk.Radiobutton(f_wx, text=lbl, variable=self.debug_wx_var, value=code,
+                           font=('Consolas',9), fg=FG, bg=BG2, selectcolor=BG3,
+                           activebackground=BG2, activeforeground=ACC,
+                           indicatoron=0, width=26, pady=3, relief='flat',
+                           cursor='hand2', command=self._apply_debug_preview).pack(fill='x', pady=1)
+        _btn(f_wx, "▶  SEND TO KEYBOARD", self._send_debug_animation,
+             fg=BG, bg=ORG).pack(anchor='w', pady=(8,0))
 
-        send_btn = _btn(wx_card, "▶  SEND TO KEYBOARD",
-                        self._send_debug_animation, fg=BG, bg=ORG)
-        send_btn.pack(anchor='w', pady=(10,0))
-
-        # ── Wind speed override ────────────────────────────────────────────────
-        tk.Frame(win, bg=SEP, height=1).pack(fill='x', padx=14, pady=(12,0))
-        wind_card = _card(win)
-        wind_card.pack(fill='x', padx=14, pady=(6,0))
-        _label(wind_card, "WIND SPEED OVERRIDE (mph)", fg=ORG).pack(anchor='w', pady=(0,6))
-
-        wind_row = tk.Frame(wind_card, bg=BG2)
-        wind_row.pack(anchor='w')
+        tk.Frame(wx_tab, bg=SEP, height=1).pack(fill='x', padx=10, pady=(10,6))
+        _label(wx_tab, "WIND SPEED OVERRIDE (mph)", fg=ORG).pack(anchor='w', padx=10, pady=(0,4))
+        wind_row = tk.Frame(wx_tab, bg=BG2); wind_row.pack(anchor='w', padx=10)
         self.debug_wind_lbl = tk.Label(wind_row, text="0 mph",
                                         font=('Consolas',10,'bold'),
                                         bg=BG2, fg=FG, width=7, anchor='w')
@@ -1575,25 +1893,17 @@ class DP104App:
                  length=180, bg=BG2, fg=DIM, troughcolor=BG3,
                  highlightthickness=0, sliderrelief='flat', bd=0,
                  activebackground=ORG).pack(side='left', padx=(6,0))
-        _label(wind_card, "Affects rain slant and snow drift. 0 = straight down.",
-               font=('Consolas',7)).pack(anchor='w', pady=(4,0))
 
-        # ── Temperature override ───────────────────────────────────────────────
-        tk.Frame(win, bg=SEP, height=1).pack(fill='x', padx=14, pady=(12,0))
-        tmp_card = _card(win)
-        tmp_card.pack(fill='x', padx=14, pady=(6,0))
-        _label(tmp_card, "TEMPERATURE OVERRIDE", fg=ORG).pack(anchor='w', pady=(0,8))
-
-        tmp_row = tk.Frame(tmp_card, bg=BG2)
-        tmp_row.pack(anchor='w')
+        tk.Frame(wx_tab, bg=SEP, height=1).pack(fill='x', padx=10, pady=(10,6))
+        _label(wx_tab, "TEMPERATURE OVERRIDE", fg=ORG).pack(anchor='w', padx=10, pady=(0,4))
+        tmp_row = tk.Frame(wx_tab, bg=BG2); tmp_row.pack(anchor='w', padx=10)
         self.temp_ovr_enabled.set(False)
-        ovr_cb = tk.Checkbutton(tmp_row, text="Enable override:",
-                                 variable=self.temp_ovr_enabled,
-                                 font=('Consolas',9), fg=FG, bg=BG2,
-                                 selectcolor=BG3, activebackground=BG2,
-                                 activeforeground=FG, cursor='hand2',
-                                 command=self._on_temp_override_toggle)
-        ovr_cb.pack(side='left')
+        tk.Checkbutton(tmp_row, text="Enable override:",
+                       variable=self.temp_ovr_enabled,
+                       font=('Consolas',9), fg=FG, bg=BG2, selectcolor=BG3,
+                       activebackground=BG2, activeforeground=FG,
+                       cursor='hand2',
+                       command=self._on_temp_override_toggle).pack(side='left')
         self.temp_ovr_entry = tk.Entry(tmp_row, textvariable=self.temp_ovr_var,
                                         width=6, font=('Consolas',10),
                                         bg=BG3, fg=FG, insertbackground=FG,
@@ -1603,57 +1913,138 @@ class DP104App:
                                         highlightcolor=ACC)
         self.temp_ovr_entry.pack(side='left', padx=(8,4))
         _label(tmp_row, "°F", fg=FG, font=('Consolas',9)).pack(side='left')
-        _label(tmp_card, "Resets to live temp on next weather poll.",
-               font=('Consolas',7)).pack(anchor='w', pady=(4,0))
+
+        # ── Now Playing tab ────────────────────────────────────────────────────
+        np_tab = tk.Frame(nb, bg=BG2); nb.add(np_tab, text=" ♪ Now Playing ")
+
+        _label(np_tab, "SOURCE ICON", fg=ORG).pack(anchor='w', pady=(8,4), padx=10)
+        NP_SOURCES = ['default','spotify','youtube','youtubemusic','twitch','winamp',
+                      'foobar2000','tidal','applemusic','amazonmusic','vlc',
+                      'soundcloud','pandora','deezer','browser']
+        self._debug_np_src = tk.StringVar(value='default')
+        self._debug_np_playing = tk.BooleanVar(value=True)
+        self._debug_np_eq = tk.BooleanVar(value=True)
+
+        src_row = tk.Frame(np_tab, bg=BG2); src_row.pack(fill='x', padx=10, pady=(0,4))
+        _label(src_row, "Source:", fg=FG, font=('Consolas',9)).pack(side='left')
+        src_dd = ttk.Combobox(src_row, textvariable=self._debug_np_src,
+                               values=NP_SOURCES, state='readonly',
+                               font=('Consolas',9), width=18)
+        src_dd.pack(side='left', padx=(6,0))
+        src_dd.bind('<<ComboboxSelected>>', lambda e: self._debug_send_np())
+
+        pp_row = tk.Frame(np_tab, bg=BG2); pp_row.pack(fill='x', padx=10, pady=(0,4))
+        tk.Checkbutton(pp_row, text="Playing (▶) / Paused (⏸)",
+                       variable=self._debug_np_playing,
+                       font=('Consolas',9), fg=FG, bg=BG2, selectcolor=BG3,
+                       activebackground=BG2, activeforeground=FG,
+                       cursor='hand2',
+                       command=self._debug_send_np).pack(side='left')
+
+        eq_row = tk.Frame(np_tab, bg=BG2); eq_row.pack(fill='x', padx=10, pady=(0,8))
+        tk.Checkbutton(eq_row, text="EQ bars enabled",
+                       variable=self._debug_np_eq,
+                       font=('Consolas',9), fg=FG, bg=BG2, selectcolor=BG3,
+                       activebackground=BG2, activeforeground=FG,
+                       cursor='hand2',
+                       command=self._debug_send_np).pack(side='left')
+
+        _btn(np_tab, "▶  SEND TO KEYBOARD", self._debug_send_np,
+             fg=BG, bg=ORG).pack(anchor='w', padx=10, pady=(0,8))
+
+        # ── Discord tab ────────────────────────────────────────────────────────
+        disc_tab = tk.Frame(nb, bg=BG2); nb.add(disc_tab, text=" 🎮 Discord ")
+
+        _label(disc_tab, "SKIN COMBINATION", fg=ORG).pack(anchor='w', pady=(8,4), padx=10)
+        DISC_KEYS = ['ggg','ggr','grg','grr','gyg','gyr',
+                     'rgg','rgr','rrg','rrr','ryg','ryr',
+                     'gig','gir','rig','rir']
+        KEY_LABELS = {
+            'ggg':'mic=on  status=online  deaf=off',
+            'ggr':'mic=on  status=online  deaf=ON',
+            'grg':'mic=on  status=dnd    deaf=off',
+            'grr':'mic=on  status=dnd    deaf=ON',
+            'gyg':'mic=on  status=away   deaf=off',
+            'gyr':'mic=on  status=away   deaf=ON',
+            'rgg':'mic=MUTED  status=online  deaf=off',
+            'rgr':'mic=MUTED  status=online  deaf=ON',
+            'rrg':'mic=MUTED  status=dnd    deaf=off',
+            'rrr':'mic=MUTED  status=dnd    deaf=ON',
+            'ryg':'mic=MUTED  status=away   deaf=off',
+            'ryr':'mic=MUTED  status=away   deaf=ON',
+            'gig':'mic=on  status=invisible  deaf=off',
+            'gir':'mic=on  status=invisible  deaf=ON',
+            'rig':'mic=MUTED  status=invisible  deaf=off',
+            'rir':'mic=MUTED  status=invisible  deaf=ON',
+        }
+        self._debug_disc_key = tk.StringVar(value='ggg')
+
+        key_row = tk.Frame(disc_tab, bg=BG2); key_row.pack(fill='x', padx=10, pady=(0,4))
+        _label(key_row, "Key:", fg=FG, font=('Consolas',9)).pack(side='left')
+        key_dd = ttk.Combobox(key_row, textvariable=self._debug_disc_key,
+                               values=[f"{k} — {KEY_LABELS[k]}" for k in DISC_KEYS],
+                               state='readonly', font=('Consolas',8), width=36)
+        key_dd.pack(side='left', padx=(6,0))
+        key_dd.bind('<<ComboboxSelected>>', lambda e: self._debug_preview_disc())
+
+        _label(disc_tab,
+               "Preview updates the Discord tab preview.\nSend pushes to keyboard.",
+               font=('Consolas',8), fg=DIM).pack(anchor='w', padx=10)
+
+        btn_row = tk.Frame(disc_tab, bg=BG2); btn_row.pack(anchor='w', padx=10, pady=(6,0))
+        _btn(btn_row, "👁  PREVIEW", self._debug_preview_disc,
+             fg=FG, bg=BG3).pack(side='left', padx=(0,6))
+        _btn(btn_row, "▶  SEND TO KEYBOARD", self._debug_send_disc,
+             fg=BG, bg=ORG).pack(side='left')
 
         # ── Footer ─────────────────────────────────────────────────────────────
-        tk.Frame(win, bg=SEP, height=1).pack(fill='x', padx=14, pady=(12,0))
+        tk.Frame(win, bg=SEP, height=1).pack(fill='x', padx=14)
         footer = tk.Frame(win, bg=BG, padx=14, pady=6)
         footer.pack(fill='x')
         tk.Label(footer, text="~  close   F1  credits",
                  font=('Consolas',7), bg=BG, fg=DIM).pack(side='left')
 
-    def _apply_debug_preview(self):
-        """Rebuild preview frames using debug overrides (animation, temp, wind)."""
-        code = self.debug_wx_var.get()
-        if code == -1:
-            return  # live mode — let next real fetch populate
-        try:
-            temp_f = 72; high_f = 85; low_f = 58; wind = 0
-            if hasattr(self, '_last_wx_data') and self._last_wx_data:
-                d = self._last_wx_data
-                try: temp_f = int(d.get('temp', 72))
-                except: pass
-                try: high_f = int(d.get('high', 85))
-                except: pass
-                try: low_f  = int(d.get('low',  58))
-                except: pass
-                try: wind   = int(d.get('wind',  0))
-                except: pass
-            # Apply overrides
-            if self.temp_ovr_enabled.get():
-                try: temp_f = int(self.temp_ovr_var.get())
-                except: pass
-            if hasattr(self, 'debug_wind_var'):
-                wind = self.debug_wind_var.get()
-            if _WX_MOD:
-                frames = _WX_MOD.build_frames(code, temp_f, high_f, low_f,
-                                              wind)  # num_frames from _FRAME_COUNTS
-                self._wx_frames = frames
-                self._prev_idx  = 0
-        except Exception:
-            pass
+    def _debug_send_np(self):
+        """Send NP debug frame to keyboard."""
+        if not _NP_MOD: return
+        src     = self._debug_np_src.get()
+        playing = self._debug_np_playing.get()
+        frames  = _NP_MOD.build_frames(src, playing)
+        send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP)
+        self._set_status(f"Debug NP sent: {src} {'playing' if playing else 'paused'}")
 
-    def _send_debug_animation(self):
-        """Send the currently previewed debug animation to the keyboard."""
-        if not self._wx_frames:
-            return
-        frames = list(self._wx_frames)
-        fps    = self._fps
-        threading.Thread(
-            target=lambda: send_pixel_animation(frames, fps=fps),
-            daemon=True).start()
+    def _debug_preview_disc(self):
+        """Preview Discord skin key in the Discord tab preview."""
+        skin = getattr(self, '_disc_skin', {})
+        raw  = self._debug_disc_key.get()
+        key  = raw.split(' — ')[0].strip()
+        if not skin:
+            # Try loading skin now
+            skin_dir = Path(__file__).parent / 'skins' / 'default'
+            try:
+                self._disc_skin = _DISC_MOD.load_skin(str(skin_dir)) if _DISC_MOD else {}
+                skin = self._disc_skin
+            except Exception: pass
+        frame = skin.get(key) if skin else None
+        if frame:
+            self.root.after(0, self._update_disc_preview, frame, key, False, 'online', False)
+            self._set_status(f"Discord preview: {key}")
+        else:
+            self._set_status(f"No skin frame for '{key}' — connect Discord first to load skin")
 
+    def _debug_send_disc(self):
+        """Send Discord skin frame to keyboard."""
+        skin = getattr(self, '_disc_skin', {})
+        raw  = self._debug_disc_key.get()
+        key  = raw.split(' — ')[0].strip()
+        frame = skin.get(key) if skin else None
+        if frame:
+            send_pixel_animation([frame], fps=self._fps, priority=PRIO_DISCORD)
+            self._set_status(f"Discord skin sent: {key}")
+        else:
+            self._set_status(f"No skin frame for '{key}' — skin not loaded")
+
+    # ── Credits ───────────────────────────────────────────────────────────────
     def _open_credits(self):
         """F1 — Credits screen."""
         win = tk.Toplevel(self.root)
@@ -1664,60 +2055,73 @@ class DP104App:
         win.bind("<F1>",    lambda e: win.destroy())
         win.bind("<grave>", lambda e: win.destroy())
 
-        # Centre on main window
         self.root.update_idletasks()
         cx = self.root.winfo_x() + self.root.winfo_width()  // 2
         cy = self.root.winfo_y() + self.root.winfo_height() // 2
         win.update_idletasks()
         win.geometry(f"+{cx - 180}+{cy - 120}")
 
-        outer = tk.Frame(win, bg=BG, padx=32, pady=28)
-        outer.pack()
+        tk.Label(win, text="DP-104 DISPLAY CONTROLLER",
+                 font=('Consolas',11,'bold'), bg=BG, fg=ACC,
+                 pady=18, padx=30).pack()
 
-        tk.Label(outer, text="DP-104 DISPLAY CONTROLLER",
-                 font=('Consolas',11,'bold'), bg=BG, fg=ACC).pack()
-        tk.Label(outer, text="v1.1.3", font=('Consolas',9),
-                 bg=BG, fg=DIM).pack(pady=(0,18))
-
-        tk.Frame(outer, bg=SEP, height=1).pack(fill='x', pady=(0,18))
-
-        rows = [
+        for name, role, col in [
             ("Claude",  "Big Guy",   ACC2),
-            ("Mikan",   "Human Guy", ORG),
-        ]
-        for name, role, color in rows:
-            row = tk.Frame(outer, bg=BG)
-            row.pack(fill='x', pady=4)
-            tk.Label(row, text=name, font=('Consolas',13,'bold'),
-                     bg=BG, fg=color, width=10, anchor='e').pack(side='left')
-            tk.Label(row, text=f"  —  {role}", font=('Consolas',10),
-                     bg=BG, fg=FG).pack(side='left')
+            ("Mikan",   "Human Guy", ACC),
+            ("remedy",  "Artist Gal", ORG),
+        ]:
+            row = tk.Frame(win, bg=BG, pady=4)
+            row.pack()
+            tk.Label(row, text=name, font=('Consolas',10,'bold'),
+                     bg=BG, fg=col, width=14, anchor='e').pack(side='left')
+            tk.Label(row, text=" — ", font=('Consolas',10),
+                     bg=BG, fg=DIM).pack(side='left')
+            tk.Label(row, text=role, font=('Consolas',10),
+                     bg=BG, fg=FG, width=14, anchor='w').pack(side='left')
 
-        tk.Frame(outer, bg=SEP, height=1).pack(fill='x', pady=(18,10))
+        tk.Label(win, text=f"2026  ·  v{APP_VERSION}",
+                 font=('Consolas',8), bg=BG, fg=DIM).pack(pady=(12,18))
 
-        tk.Label(outer, text="2026", font=('Consolas',10),
-                 bg=BG, fg=DIM).pack()
+    # ── Quit / lifecycle ──────────────────────────────────────────────────────
+    def _on_minimize(self, event=None):
+        self.root.withdraw()
+        if self.tray:
+            self.tray.visible = True
 
-        tk.Label(outer, text="F1 or ~  to close",
-                 font=('Consolas',7), bg=BG, fg=DIM, pady=(10)).pack()
 
-    def _quit(self, icon=None, item=None):
+    def _on_close(self):
         self._save_settings()
+        self._disc_disconnect()
         self.running = False
         if self.tray:
             try: self.tray.stop()
             except: pass
-        self.root.after(0, self.root.destroy)
+        self.root.destroy()
+
+    def _quit(self):
+        self._on_close()
 
     def run(self):
         self.root.mainloop()
 
 
+APP_VERSION = "1.2.5"
+
+
 if __name__ == '__main__':
-    if not _hid:
-        import tkinter.messagebox as mb
-        tk.Tk().withdraw()
-        mb.showerror("Missing dependency", "pip install hidapi")
+    try:
+        app = DP104App()
+    except Exception as _e:
+        import traceback as _tb
+        _msg = _tb.format_exc()
+        print(_msg, file=sys.stderr)
+        try:
+            import tkinter as _tk
+            import tkinter.messagebox as _mb
+            _r = _tk.Tk(); _r.withdraw()
+            _mb.showerror("DP-104 Startup Error", _msg[:1200])
+            _r.destroy()
+        except Exception:
+            pass
         sys.exit(1)
-    app = DP104App()
     app.run()

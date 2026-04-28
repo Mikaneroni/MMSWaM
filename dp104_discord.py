@@ -224,11 +224,16 @@ class DiscordIPC:
     """
 
     def __init__(self, client_id, client_secret=None,
-                 token_cache='.discord_token', on_state_change=None):
+                 token_cache='.discord_token',
+                 on_state_change=None, on_ready=None,
+                 on_vc_leave=None, on_vc_join=None):
         self.client_id       = client_id
         self.client_secret   = client_secret
         self.token_cache     = token_cache
         self.on_state_change = on_state_change
+        self.on_ready        = on_ready
+        self.on_vc_leave     = on_vc_leave
+        self.on_vc_join      = on_vc_join
         self._pipe_handle    = None
         self._k32            = None
         self._running        = False
@@ -239,8 +244,9 @@ class DiscordIPC:
         self.deafened         = False
         self.status           = 'online'
         self._ever_received   = False
-        self._idle_threshold  = 300   # seconds before marking Away (default 5 min)
-        self._idle_monitoring = True  # enable idle→Away detection
+        self._in_vc           = False      # True when in a voice channel
+        self._idle_threshold  = 300
+        self._idle_monitoring = True
 
     # ── Pipe I/O (Windows named pipe via ctypes) ──────────────────────────────
     def _connect_pipe(self):
@@ -547,16 +553,20 @@ class DiscordIPC:
             raise RuntimeError("Could not authenticate with Discord IPC")
 
         print("[Discord IPC] Ready — polling mic/deafen state.")
+        if self.on_ready:
+            try: self.on_ready()
+            except Exception: pass
         last_poll = 0.0
 
         while self._running:
             try:
                 now = time.time()
 
-                # Poll GET_VOICE_SETTINGS every 2 seconds
+                # Poll every 2 seconds
                 if now - last_poll >= 2.0:
                     self._cmd("GET_VOICE_SETTINGS")
-                    self._check_idle()   # update Away status from system idle time
+                    self._cmd("GET_SELECTED_VOICE_CHANNEL")  # detect VC join/leave
+                    self._check_idle()
                     last_poll = now
 
                 # Non-blocking check for incoming data
@@ -571,15 +581,23 @@ class DiscordIPC:
                     evt = msg.get('evt', '')
                     d   = msg.get('data') or {}
 
-                    # Uncomment to debug all messages:
-                    # print(f"[IPC] cmd={cmd} evt={evt} keys={list(d.keys())[:6]}")
-
                     if evt == 'ERROR':
-                        print(f"[IPC] ERROR code={d.get('code')} message={d.get('message')}")
-                    else:
-                        print(f"[IPC] cmd={cmd} evt={evt} data_keys={list(d.keys())[:8]}")
+                        print(f"[IPC] ERROR code={d.get('code')} msg={d.get('message')}")
                     if cmd == 'GET_VOICE_SETTINGS' and evt != 'ERROR':
                         self._apply_voice_settings(d)
+                    elif cmd == 'GET_SELECTED_VOICE_CHANNEL':
+                        # id present = in a VC; empty/null = not in VC
+                        in_vc = bool(d and d.get('id'))
+                        if in_vc and not self._in_vc:
+                            print(f"[Discord IPC] Joined: {d.get('name','?')}")
+                            self._in_vc = True
+                            if self.on_vc_join:
+                                self.on_vc_join()
+                        elif not in_vc and self._in_vc and self._ever_received:
+                            print("[Discord IPC] Left voice channel")
+                            self._in_vc = False
+                            if self.on_vc_leave:
+                                self.on_vc_leave()
                 else:
                     time.sleep(0.05)   # 50ms idle — near-zero CPU
 
