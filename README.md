@@ -18,37 +18,39 @@ Built through reverse engineering the keyboard's Raw HID protocol from USB traff
 
 ### ♪ Now Playing
 - Pulls the current track from any Windows media session (Spotify, browsers, VLC, etc.)
-- **Custom pixel page** — floating source icon, brand-color background, 9-bar EQ visualizer
+- **Custom pixel page** — floating source icon with brand-color background, 9-bar EQ visualizer
 - **16 source icons** — Spotify, YouTube, YouTube Music, Twitch, WinAMP, foobar2000, TIDAL, Apple Music, Amazon Music, VLC, SoundCloud, Pandora, Deezer, Browser, and more
 - EQ animates while playing, silences when paused
-- Text scroll always sends first; pixel animation follows
 - Toggle between custom pixel display and text-scroll-only mode
 
 ### 🎮 Discord VC
 - Mic mute and deafen status at a glance — read automatically from Discord local IPC
 - Online status (Online / Away / DnD / Invisible) set manually in GUI
-- VC join/leave detected automatically via `GET_SELECTED_VOICE_CHANNEL` — fallback display restores when you leave
-- One-time OAuth2 authorization via Discord popup; token cached locally
+- One-time OAuth2 authorization; token cached locally after first run
+- **Skin system** — 12 PNG files (24×8 each) in `skins/default/`, artist-designed by remedy
 - Idle detection — auto-sets Away after 5 minutes of system inactivity (never overrides DnD/Invisible)
-- **Skin system** — 12 PNG files (24×8 each) in `skins/default/`, artist-designed
 - Invisible variant auto-generated from online variants
 
+### ⌨ WPM Tracker
+- Tracks rolling 60-second keystroke average globally
+- **24×8 pixel display** — 10-bar history graph (one bar per minute) + current WPM number
+- **Color relative to personal best**: Green (casual) → Yellow (average) → Red (pushing)
+- Personal best cached to `dp104_wpm_pb.json`, persists between sessions
+- Configurable send interval (1 / 2 / 5 / 10 / 15 / 30 seconds)
+- Uses Windows `GetAsyncKeyState` polling — works inside the GUI process
+
 ### 🖥 GUI
-- **Live 24×8 pixel previews** on Weather, Now Playing, and Discord tabs
-- **Three tabs** — Now Playing, Weather, Discord — right-clickable to enable/disable
-- **Weather tab color states**:
-  - 🟢 Green — weather on, Discord tab off
-  - 🟡 Yellow — Discord on, not in VC (weather showing, will be overwritten when VC starts)
-  - 🟠 Orange — Discord in VC (weather suppressed)
-  - 🔴 Red — weather disabled
-- **Priority system** — Discord VC > NP Custom > Weather for the pixel page
+- **Live 24×8 pixel previews** on all four tabs
+- **Four tabs** — Now Playing, Weather, Discord, WPM — right-clickable to enable/disable
+- **Weather tab color states**: 🟢 normal · 🟡 Discord on, not in VC · 🟠 Discord in VC · 🔴 disabled
+- **Priority system** for the custom pixel page: Discord (1) > NP Custom (2) > Weather (3) > WPM (4)
 - **4-second cooldown** between keyboard sends — prevents firmware crashes
+- **Shared HID lock** — text sends and pixel sends are fully serialized, no concurrent device access
 - **FPS selector** — 5 / 10 / 15 / 20 fps
 - **Settings persistence** — all preferences saved on exit, restored on launch
 - **Debug menu** (`~` key) — Weather / Now Playing / Discord tabs with full send controls
-- **Page switch** — CLEAR button switches keyboard to blank page
 - **Credits** (`F1`) — Big Guy, Human Guy, Artist Gal
-- **System tray** — minimize to tray, X exits completely
+- **System tray** — TRAY button minimizes to tray; X button exits completely
 - **Windows toast notifications** on successful weather update
 
 ---
@@ -62,7 +64,7 @@ Built through reverse engineering the keyboard's Raw HID protocol from USB traff
 ### Python dependencies
 
 ```
-pip install hidapi pystray pillow
+pip install hidapi pystray pillow pynput
 ```
 
 ---
@@ -72,13 +74,14 @@ pip install hidapi pystray pillow
 1. Clone or download this repository
 2. Install dependencies:
    ```
-   pip install hidapi pystray pillow
+   pip install hidapi pystray pillow pynput
    ```
 3. Place all files in the **same folder**:
    - `dp104_gui.pyw`
    - `dp104_weather_v2.py`
    - `dp104_nowplaying.py`
    - `dp104_discord.py`
+   - `dp104_wpm.py`
 4. For Discord VC: create `skins\default\` and add the 12 skin PNG files
 5. Run:
    ```
@@ -95,8 +98,10 @@ pip install hidapi pystray pillow
 | `dp104_weather_v2.py` | Weather animation engine — 8 animation types |
 | `dp104_nowplaying.py` | Now Playing pixel display — 16 source icons, EQ |
 | `dp104_discord.py` | Discord VC — IPC client, OAuth2, skin loader |
+| `dp104_wpm.py` | WPM tracker — keystroke counting, pixel frame builder |
 | `skins/default/*.png` | Discord VC skin files (12 PNGs, 24×8 each) |
 | `dp104_settings.json` | Auto-generated settings |
+| `dp104_wpm_pb.json` | Auto-generated WPM personal best cache |
 | `.discord_token` | Auto-generated OAuth2 token cache |
 
 ---
@@ -105,17 +110,13 @@ pip install hidapi pystray pillow
 
 1. Go to [discord.com/developers/applications](https://discord.com/developers/applications)
 2. Create a new application (free)
-3. Under **OAuth2 → Redirects**, add `http://127.0.0.1` and `http://localhost`
-4. Make sure **Public Client** is **OFF** in OAuth2 settings
-5. Copy your **Client ID** from General Information
-6. Copy your **Client Secret** from General Information
-7. In the GUI Discord tab: paste Client ID, paste Client Secret, click **Connect**
-8. Discord shows a native authorization popup — click **Authorize**
-9. Token cached in `.discord_token` — client secret only needed once
+3. Under **OAuth2 → Redirects**, add `http://127.0.0.1`
+4. Copy your **Client ID** and **Client Secret** from General Information
+5. In the GUI Discord tab: paste Client ID, paste Client Secret, click **Connect**
+6. Discord shows a native authorization popup — click **Authorize** in the Discord desktop app (not the browser)
+7. Token cached in `.discord_token` — client secret only needed once
 
 ### Skin File Naming
-
-24×8 PNGs in `skins/default/`, named by state:
 
 | Letter | Represents | Values |
 |--------|-----------|--------|
@@ -123,8 +124,8 @@ pip install hidapi pystray pillow
 | 2nd | Status | `g` = online, `y` = away, `r` = DnD |
 | 3rd | Deafen | `g` = undeafened, `r` = deafened |
 
-Examples: `ggg.png`, `rrr.png`, `ryr.png`, `gyg.png`
-Invisible variants (`gi*`, `ri*`) are auto-generated — no extra files needed.
+Examples: `ggg.png`, `rrr.png`, `ryr.png`
+Invisible variants auto-generated — no extra files needed.
 
 ---
 
@@ -136,49 +137,30 @@ The DP-104 exposes a Raw HID interface (`VID=0xE560 PID=0xE104 MI_01`).
 Sends ASCII text to the keyboard's scrolling display. Used for Now Playing text.
 
 **Pixel / Custom page** (`0xD1 0x30` → `0xD1 0x31` packets)
-Streams HSV pixel frames to the 24×8 LED matrix. Protocol requires:
+Streams HSV pixel frames to the 24×8 LED matrix. Protocol:
 - Header packet with frame count and FPS, followed by ACK read
 - 1-second buffer allocation delay
 - 25-byte pixel chunks with 4-byte global offsets
 - 320ms inter-frame gap between frames
 
 **Page switch** (`0x07 0x1A 0x02 [page] ...`)
-Switches the active display page: `0x00` = OFF, `0x02` = CUSTOM, `0x06` = SCROLL.
+Switches the display: `0x00` = OFF, `0x02` = CUSTOM, `0x06` = SCROLL.
 
 **Pixel format:** HSV (not RGB). Hardware quirk: any pixel with saturation > 0 at brightness < 20/255 renders red regardless of hue. All color math respects this threshold.
 
-**Priority queue:** A single background worker serialises all sends. 4-second cooldown between sends. Higher-priority sends discard pending lower-priority ones — Discord always wins over NP which always wins over Weather.
-
----
-
-## Weather Animation Codes
-
-| Code | Animation | When Used |
-|------|-----------|-----------|
-| 0 | Sunny | Clear day |
-| 1 | Partly Cloudy | Partly cloudy day |
-| 2 | Cloudy (House) | Overcast / foggy |
-| 3 | Rainy | Rain / drizzle / showers |
-| 4 | Snowy | Snow / sleet / ice |
-| 5 | Thunderstorm | Thunder / storms |
-| 6 | Night Clear | Clear night |
-| 7 | Night Partly Cloudy | Partly cloudy night |
+**Priority queue + HID lock:** A single background worker serialises all pixel sends with a 4-second cooldown. A shared `threading.Lock()` also gates text sends so nothing overlaps at the device level.
 
 ---
 
 ## Troubleshooting
 
-**GUI opens then immediately goes to tray**
-Was a startup bug in older versions — fixed in v1.2.5. If it still happens, run `python dp104_gui.pyw` from the console to see the full error.
+**WPM shows 0** — Make sure `dp104_wpm.py` is in the same folder. The tracker uses `GetAsyncKeyState` polling — no extra setup needed, but it only counts keystrokes while the GUI process is running.
 
-**Discord shows "Authenticating..." for a long time**
-Normal — OAuth2 with the Discord popup takes 15–20 seconds. After 30 seconds it switches to "Connected (verifying...)" which means it's still working. Don't close it.
+**Discord stays on "Authenticating"** — Auth takes 15–20 seconds. The popup appears in the Discord desktop client, not the browser. If you don't see it, check that Discord is open and running.
 
-**Weather tab shows Orange instead of Yellow**
-Fixed in v1.2.5. Previously VC status was set incorrectly from voice settings updates rather than from `GET_SELECTED_VOICE_CHANNEL`.
+**Weather tab shows Orange instead of Yellow** — Discord tab is enabled and the GUI detects you may be in a VC. Set Discord to disabled if not using it.
 
-**Keyboard crashes / flashes then goes blank**
-Previously caused by concurrent HID sends. Fixed in v1.2.0 with the priority queue and 4-second cooldown.
+**Keyboard crashes occasionally** — The 4-second cooldown between sends and the shared HID lock reduce this to a rare edge case. If it happens, CLEAR and wait a few seconds before the next send.
 
 ---
 
@@ -190,6 +172,6 @@ Previously caused by concurrent HID sends. Fixed in v1.2.0 with the priority que
 | **Mikan** | Human Guy |
 | **remedy** | Artist Gal |
 
-*2026 · v1.2.5*
+*2026 · v1.3.0*
 
-> **Note:** This targets a specific firmware version of the DP-104. If TickType releases a firmware update that changes the HID protocol, byte sequences may need updating. The debug menu (`~`) and CHANGELOG.md will orient anyone picking up where we left off.
+> **Note:** Targets a specific firmware version of the DP-104. If TickType releases a firmware update, byte sequences may need updating. The debug menu (`~`) and CHANGELOG.md will orient anyone picking up where we left off.

@@ -11,12 +11,14 @@ _NO_WINDOW = 0x08000000
 from pathlib import Path
 
 # Optional: load dp104_nowplaying and dp104_discord if present alongside gui
-_NP_MOD = None
+_NP_MOD   = None
 _DISC_MOD = None
+_WPM_MOD  = None
 try:
     import importlib.util as _ilu
     for _mod_name, _mod_var in [('dp104_nowplaying', '_NP_MOD'),
-                                  ('dp104_discord',   '_DISC_MOD')]:
+                                  ('dp104_discord',   '_DISC_MOD'),
+                                  ('dp104_wpm',       '_WPM_MOD')]:
         _p = Path(__file__).parent / f"{_mod_name}.py"
         if _p.exists():
             _spec = _ilu.spec_from_file_location(_mod_name, str(_p))
@@ -73,15 +75,32 @@ for _name in ('hid', 'hidapi'):
 
 RAW_USAGE_PAGE   = 0xFF60
 
+# ── Tray restore flag (thread-safe primitive) ─────────────────────────────────
+import threading as _threading
+_SHOW_WINDOW_FLAG = _threading.Event()
+
+# ── Shared HID send lock ──────────────────────────────────────────────────────
+# ALL keyboard sends (text AND pixel) must hold this lock.
+# Prevents concurrent HID access which crashes the keyboard firmware.
+_HID_LOCK = threading.Lock()
+
 # ── Pixel send priority queue ─────────────────────────────────────────────────
 # Priorities: lower number = higher priority
 PRIO_DISCORD = 1   # Discord VC skin — highest priority
 PRIO_NP      = 2   # Now Playing custom pixel page
 PRIO_WEATHER = 3   # Weather animation — lowest priority
+PRIO_WPM     = 4   # WPM tracker — lowest priority
 
 def _send_direct(frames, fps=10, retries=3, retry_delay=2.0):
-    """Execute a pixel send synchronously. Called only from _PixelQueue worker."""
+    """Execute a pixel send synchronously. Called only from _PixelQueue worker.
+    Holds _HID_LOCK to prevent concurrent access with text sends."""
     if not _hid: return False, "HID library not available"
+    with _HID_LOCK:
+        return _send_direct_locked(frames, fps, retries, retry_delay)
+
+
+def _send_direct_locked(frames, fps=10, retries=3, retry_delay=2.0):
+    """Inner send — called only while _HID_LOCK is held."""
     last_err = "Unknown error"
     for attempt in range(1, retries + 1):
         dev = _hid.device()
@@ -118,6 +137,7 @@ def _send_direct(frames, fps=10, retries=3, retry_delay=2.0):
                 time.sleep(retry_delay)  # wait before retry
 
     return False, f"Failed after {retries} attempts: {last_err}"
+    # (end of _send_direct_locked)
 
 
 class _PixelQueue:
@@ -168,7 +188,7 @@ MAX_TEXT_LEN     = 30
 PIXEL_W, PIXEL_H = 24, 8
 FRAME_BYTES      = PIXEL_W * PIXEL_H * 3
 
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.3.0"
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 BG   = '#0b0c14'   # near-black background
@@ -272,26 +292,28 @@ def find_dp104():
     return None
 
 def send_to_keyboard(title, artist):
-    """Send Now Playing text via scroll protocol."""
+    """Send Now Playing text via scroll protocol.
+    Holds _HID_LOCK to prevent concurrent access with pixel sends."""
     if not _hid: return False
     info = find_dp104()
     if not info: return False
-    try:
-        dev = _hid.device()
-        dev.open_path(info['path'])
-        def send_block(block, text):
-            enc = sanitize(text).encode('ascii', errors='replace')[:MAX_TEXT_LEN]
-            pad = enc + b'\x00' * (MAX_TEXT_LEN - len(enc))
-            dev.write([0x00] + list(make_text_packet(block, 0,    pad[0:26])))
-            time.sleep(0.03)
-            dev.write([0x00] + list(make_text_packet(block, 0x1a, pad[26:30])))
-            time.sleep(0.03)
-        send_block(0, title); send_block(1, artist)
-        for b in (2, 3, 4): send_block(b, '')
-        dev.close()
-        return True
-    except Exception:
-        return False
+    with _HID_LOCK:
+        try:
+            dev = _hid.device()
+            dev.open_path(info['path'])
+            def send_block(block, text):
+                enc = sanitize(text).encode('ascii', errors='replace')[:MAX_TEXT_LEN]
+                pad = enc + b'\x00' * (MAX_TEXT_LEN - len(enc))
+                dev.write([0x00] + list(make_text_packet(block, 0,    pad[0:26])))
+                time.sleep(0.03)
+                dev.write([0x00] + list(make_text_packet(block, 0x1a, pad[26:30])))
+                time.sleep(0.03)
+            send_block(0, title); send_block(1, artist)
+            for b in (2, 3, 4): send_block(b, '')
+            dev.close()
+            return True
+        except Exception:
+            return False
 
 # ── Weather module loader ─────────────────────────────────────────────────────
 def _load_weather_mod():
@@ -540,22 +562,23 @@ def switch_page(dev, page):
     dev.write(pkt2)   # 1 + 3 + 29 = 33 bytes ✓
 
 def switch_page_safe(page):
-    """Open keyboard, switch page, close. Safe to call from any thread."""
+    """Open keyboard, switch page, close. Holds _HID_LOCK."""
     if not _hid: return
-    dev = _hid.device()
-    try:
+    with _HID_LOCK:
+        dev = _hid.device()
         try:
-            dev.open_path(DP104_PIXEL_PATH)
-        except Exception:
-            info = find_dp104()
-            if not info: return
-            dev.open_path(info['path'])
-        dev.set_nonblocking(False)
-        switch_page(dev, page)
-        dev.close()
-    except Exception as e:
-        try: dev.close()
-        except: pass
+            try:
+                dev.open_path(DP104_PIXEL_PATH)
+            except Exception:
+                info = find_dp104()
+                if not info: return
+                dev.open_path(info['path'])
+            dev.set_nonblocking(False)
+            switch_page(dev, page)
+            dev.close()
+        except Exception as e:
+            try: dev.close()
+            except: pass
 
 # ── Windows toast notification ─────────────────────────────────────────────────
 def _toast_weather(data):
@@ -702,14 +725,9 @@ class DP104App:
         self.root.minsize(480, 540)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
-        # <Unmap> fires during initial draw on Windows — guard with a flag
-        self._window_ready = False
-        def _on_unmap(e):
-            if self._window_ready and e.widget is self.root:
-                self._on_minimize()
-        self.root.bind("<Unmap>", _on_unmap)
-        self.root.bind("<grave>", lambda e: self._open_debug())   # tilde/backtick key
-        self.root.bind("<F1>",    lambda e: self._open_credits())  # F1 = credits
+        # Minimize-to-tray only on explicit TRAY button — no <Unmap> binding
+        self.root.bind("<grave>", lambda e: self._open_debug())
+        self.root.bind("<F1>",    lambda e: self._open_credits())
         self._debug_win = None
         # Temp override vars (initialised here, used by debug menu + _do_fetch_weather)
         self.temp_ovr_var     = tk.StringVar(value='')
@@ -734,6 +752,8 @@ class DP104App:
         self._np_frames         = []
         self._np_prev_idx       = 0
         self._np_custom         = True   # True = pixel page, False = text scroll only
+        self._wpm_tracker       = None   # WPMTracker instance (started when tab enabled)
+        self._wpm_enabled       = None   # BooleanVar — created in _build_ui
 
         self._build_ui()
         self._load_settings()   # load after vars exist
@@ -743,8 +763,7 @@ class DP104App:
         self.root.after(2000, self._check_connection)
         self.root.after(400,  self._tick_preview)
         self.root.after(1500, self._disc_autoconnect)  # auto-connect if saved creds
-        # Allow <Unmap> to work only after first draw completes
-        self.root.after(500, lambda: setattr(self, '_window_ready', True))
+        self.root.after(250, self._poll_show_flag)
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -802,9 +821,11 @@ class DP104App:
             btn.bind('<Control-Button-1>', lambda e, v=val, ev=en_var: self._toggle_tab(v, ev))
 
         self.discord_enabled = tk.BooleanVar(value=False)
+        self._wpm_enabled    = tk.BooleanVar(value=False)
         _make_tab('nowplaying', '  ♪  NOW PLAYING  ', self.np_enabled)
         _make_tab('weather',    '  ⛅  WEATHER  ',    self.wx_enabled)
         _make_tab('discord',    '  🎮  DISCORD  ',    self.discord_enabled)
+        _make_tab('wpm',        '  ⌨  WPM  ',        self._wpm_enabled)
 
         self.mode_var.trace_add('write', self._style_tabs)
 
@@ -1102,6 +1123,44 @@ class DP104App:
         self.disc_preview = PixelPreview(self.disc_panel)
         self.disc_preview.pack(anchor='w')
 
+                # ── WPM panel ────────────────────────────────────────────────────────────────────
+        self.wpm_panel = _card(r)
+        _wh = tk.Frame(self.wpm_panel, bg=BG2)
+        _wh.pack(fill='x', pady=(0,6))
+        _label(_wh, "TYPING SPEED").pack(side='left')
+        self.lbl_wpm_live = tk.Label(_wh, text="— WPM",
+                                      font=('Consolas',11,'bold'), bg=BG2, fg=ACC)
+        self.lbl_wpm_live.pack(side='right')
+        _wp = tk.Frame(self.wpm_panel, bg=BG2)
+        _wp.pack(fill='x', pady=(0,4))
+        _label(_wp, "Personal best:", fg=DIM, font=('Consolas',8)).pack(side='left')
+        self.lbl_wpm_pb = tk.Label(_wp, text="—",
+                                    font=('Consolas',8,'bold'), bg=BG2, fg=ACC2)
+        self.lbl_wpm_pb.pack(side='left', padx=(6,0))
+        # Update interval selector
+        _wi_row = tk.Frame(self.wpm_panel, bg=BG2)
+        _wi_row.pack(fill='x', pady=(6,0))
+        _label(_wi_row, "Send to keyboard every:", fg=DIM, font=('Consolas',8)).pack(side='left')
+        self._wpm_interval_var = tk.StringVar(value='5')
+        tk.Spinbox(_wi_row, values=(1, 2, 5, 10, 15, 30), width=4,
+                   textvariable=self._wpm_interval_var,
+                   font=('Consolas',8), bg=BG3, fg=FG,
+                   buttonbackground=BG3, insertbackground=FG,
+                   relief='flat').pack(side='left', padx=(6,4))
+        _label(_wi_row, "seconds", fg=DIM, font=('Consolas',8)).pack(side='left')
+        _label(self.wpm_panel, "ℹ  Tracks keystrokes globally  (pip install pynput).\n   Rolling 60s average sent to CUSTOM page at PRIO_WPM.",
+               font=('Consolas',7), fg=DIM).pack(anchor='w', pady=(4,0))
+
+        _divider(self.wpm_panel, pady=(8,6))
+        wpm_prev_hdr = tk.Frame(self.wpm_panel, bg=BG2)
+        wpm_prev_hdr.pack(fill='x', pady=(0,4))
+        _label(wpm_prev_hdr, "PREVIEW").pack(side='left')
+        self.lbl_wpm_frame = tk.Label(wpm_prev_hdr, text="",
+                                       font=('Consolas',8), bg=BG2, fg=DIM)
+        self.lbl_wpm_frame.pack(side='right')
+        self.wpm_preview = PixelPreview(self.wpm_panel)
+        self.wpm_preview.pack(anchor='w')
+
         # ── Status bar ────────────────────────────────────────────────────────
         _divider(r, padx=14, pady=(6,0))
         status_bar = tk.Frame(r, bg=BG, padx=14, pady=6)
@@ -1150,20 +1209,18 @@ class DP104App:
 
     def _style_tabs(self, *_):
         """Colour tab buttons. Weather has 4 states based on Discord status."""
-        active    = self.mode_var.get()
-        disc_on   = self.discord_enabled and self.discord_enabled.get()
-        in_vc     = self._discord_in_vc
-        wx_on     = self.wx_enabled and self.wx_enabled.get()
-        np_on     = self.np_enabled and self.np_enabled.get()
-        disc_en   = disc_on
+        active  = self.mode_var.get()
+        disc_on = self.discord_enabled and self.discord_enabled.get()
+        in_vc   = self._discord_in_vc
+        wx_on   = self.wx_enabled   and self.wx_enabled.get()
+        np_on   = self.np_enabled   and self.np_enabled.get()
+        wpm_on  = bool(self._wpm_enabled and self._wpm_enabled.get())
 
         for val, btn in self._tab_btns.items():
             is_active = (val == active)
-            dim_mult  = '' if is_active else '0a1f13'
 
             if val == 'nowplaying':
-                enabled = np_on
-                if not enabled:
+                if not np_on:
                     btn.config(bg='#2b0a0e', fg=RED)
                 elif is_active:
                     btn.config(bg='#0d3b22', fg=ACC)
@@ -1172,22 +1229,29 @@ class DP104App:
 
             elif val == 'weather':
                 if not wx_on:
-                    btn.config(bg='#2b0a0e', fg=RED)           # red: disabled
-                elif disc_en and in_vc:
-                    btn.config(bg='#2b1800', fg=ORG)            # orange: discord in VC
-                elif disc_en and not in_vc:
-                    btn.config(bg='#2b2b00', fg='#e0e000')      # yellow: discord active, no VC
+                    btn.config(bg='#2b0a0e', fg=RED)
+                elif disc_on and in_vc:
+                    btn.config(bg='#2b1800', fg=ORG)
+                elif disc_on and not in_vc:
+                    btn.config(bg='#2b2b00', fg='#e0e000')
                 elif is_active:
-                    btn.config(bg='#0d3b22', fg=ACC)            # green: normal active
+                    btn.config(bg='#0d3b22', fg=ACC)
                 else:
-                    btn.config(bg='#0a1f13', fg='#00a060')      # dim green: normal inactive
+                    btn.config(bg='#0a1f13', fg='#00a060')
 
             elif val == 'discord':
-                enabled = disc_en
-                if not enabled:
+                if not disc_on:
                     btn.config(bg='#2b0a0e', fg=RED)
                 elif in_vc:
-                    btn.config(bg='#0d1a2b', fg=ACC2)           # blue: in VC
+                    btn.config(bg='#0d1a2b', fg=ACC2)
+                elif is_active:
+                    btn.config(bg='#0d3b22', fg=ACC)
+                else:
+                    btn.config(bg='#0a1f13', fg='#00a060')
+
+            elif val == 'wpm':
+                if not wpm_on:
+                    btn.config(bg='#2b0a0e', fg=RED)
                 elif is_active:
                     btn.config(bg='#0d3b22', fg=ACC)
                 else:
@@ -1198,7 +1262,14 @@ class DP104App:
         self.mode_var.set(val)
         self._on_mode_change()
         self._style_tabs()
-
+        # Auto-start WPM tracker the first time the WPM tab is visited
+        if val == 'wpm' and _WPM_MOD:
+            if self._wpm_tracker is None:
+                self._wpm_start()
+            # Also enable the tab so the poll loop picks it up
+            if self._wpm_enabled and not self._wpm_enabled.get():
+                self._wpm_enabled.set(True)
+                self._style_tabs()
     def _toggle_tab(self, tab, enabled_var):
         """Right-click: flip enabled state for that tab."""
         enabled_var.set(not enabled_var.get())
@@ -1224,10 +1295,14 @@ class DP104App:
                     self.root.after(0, self._update_np_display, '', '')
                 elif tab == 'discord':
                     self._disc_disconnect()
+                elif tab == 'wpm':
+                    self._wpm_stop()
             threading.Thread(target=_clear, daemon=True).start()
 
         self._style_tabs()
-        labels = {'nowplaying':'Now Playing','weather':'Weather','discord':'Discord'}
+        if enabled and tab == 'wpm':
+            self._wpm_start()
+        labels = {'nowplaying':'Now Playing','weather':'Weather','discord':'Discord','wpm':'WPM'}
         lbl = labels.get(tab, tab)
         self._set_status(f"{lbl} {'enabled' if enabled else 'disabled'}")
 
@@ -1236,12 +1311,15 @@ class DP104App:
         self.np_panel.pack_forget()
         self.wx_panel.pack_forget()
         self.disc_panel.pack_forget()
+        self.wpm_panel.pack_forget()
         if self.mode == 'nowplaying':
             self.np_panel.pack(fill='x', padx=14, pady=(0,0))
         elif self.mode == 'weather':
             self.wx_panel.pack(fill='x', padx=14, pady=(0,0))
-        else:
+        elif self.mode == 'discord':
             self.disc_panel.pack(fill='x', padx=14, pady=(0,0))
+        else:
+            self.wpm_panel.pack(fill='x', padx=14, pady=(0,0))
         self.root.update_idletasks()
 
     def _on_interval(self):
@@ -1269,15 +1347,18 @@ class DP104App:
             threading.Thread(target=self.tray.run, daemon=True).start()
 
     def _show_window(self, icon=None, item=None):
-        """Called from pystray thread. event_generate is the only thread-safe
-        tkinter call — posts <<ShowWindow>> to the main loop event queue."""
-        try:
-            self.root.event_generate('<<ShowWindow>>', when='tail')
-        except Exception:
-            pass
+        """Called from pystray thread. Sets a flag — main loop polls and restores."""
+        _SHOW_WINDOW_FLAG.set()
+
+    def _poll_show_flag(self):
+        """Runs on main thread every 250ms. Restores window if flag is set."""
+        if _SHOW_WINDOW_FLAG.is_set():
+            _SHOW_WINDOW_FLAG.clear()
+            self._do_show_window()
+        self.root.after(250, self._poll_show_flag)
 
     def _do_show_window(self, event=None):
-        """Actual restore — runs on main tkinter thread via <<ShowWindow>> event."""
+        """Actual restore — always called on main tkinter thread."""
         try:
             self.root.deiconify()
             self.root.state('normal')
@@ -1329,15 +1410,28 @@ class DP104App:
         Both NP and Weather run concurrently regardless of active tab.
         NP text protocol and weather pixel protocol use separate keyboard pages.
         """
-        # Start countdown at interval so weather doesn't fire on very first tick.
-        # Settings may not be fully loaded yet when the thread starts.
         try:    wx_countdown = -5   # fire first fetch ~5s after startup
         except: wx_countdown = -5
         wx_fetching  = False
         np_fetching  = False
+        wpm_countdown = 0.0   # sends immediately on first poll
 
         while True:
             if self.running:
+
+                                # ── WPM ──────────────────────────────────────────────────────
+                if self._wpm_tracker:
+                    self.root.after(0, self._wpm_update_ui)
+                    wpm_countdown -= self.interval
+                    if bool(self._wpm_enabled and self._wpm_enabled.get()) and wpm_countdown <= 0:
+                        try:
+                            _wpm_int = float(getattr(self, '_wpm_interval_var',
+                                             type('x', (), {'get': lambda s: '5'})()).get())
+                        except Exception:
+                            _wpm_int = 5.0
+                        wpm_countdown = _wpm_int
+                        _wf = self._wpm_tracker.get_frame()
+                        send_pixel_animation([_wf], fps=5, priority=PRIO_WPM)
 
                 # ── Now Playing — runs when enabled, regardless of active tab ──
                 np_on = bool(self.np_enabled and self.np_enabled.get())
@@ -1350,11 +1444,12 @@ class DP104App:
                             if result:
                                 title, artist, app_id = result
                                 if (title, artist) != self.last_np:
-                                    # Always send text scroll first
+                                    # Always send text scroll first, then wait 1s
                                     send_to_keyboard(title, artist)
                                     self.last_np = (title, artist)
                                     self.root.after(0, self._update_np_display,
                                                     title, artist)
+                                    time.sleep(1.0)  # let keyboard finish text before pixels
                                     # If custom NP enabled and not Discord in VC, send pixel page
                                     if (self._np_custom and _NP_MOD and
                                             not self._discord_in_vc):
@@ -1712,6 +1807,51 @@ class DP104App:
         except Exception:
             pass
 
+    def _wpm_start(self):
+        """Start the WPM tracker."""
+        if not _WPM_MOD:
+            self._set_status("dp104_wpm.py not found — place it next to the gui")
+            return
+        if self._wpm_tracker is None:
+            try:
+                self._wpm_tracker = _WPM_MOD.WPMTracker()
+                self._wpm_tracker.start()
+                self._set_status("WPM tracker started")
+            except Exception as e:
+                self._set_status(f"WPM start failed: {e}")
+
+    def _wpm_stop(self):
+        """Stop the WPM tracker."""
+        if self._wpm_tracker:
+            self._wpm_tracker.stop()
+            self._wpm_tracker = None
+            self._set_status("WPM tracker stopped")
+
+    def _wpm_update_ui(self):
+        """Update WPM panel labels and preview from tracker data."""
+        if not self._wpm_tracker:
+            try:
+                self.lbl_wpm_live.config(text="— WPM")
+                self.lbl_wpm_pb.config(text="—")
+            except Exception:
+                pass
+            return
+        cur = self._wpm_tracker.current_wpm
+        pb  = self._wpm_tracker.personal_best
+        try:
+            self.lbl_wpm_live.config(text=f"{cur:.0f} WPM")
+            self.lbl_wpm_pb.config(text=f"{pb:.0f} WPM")
+        except Exception:
+            pass
+        try:
+            frame = self._wpm_tracker.get_frame()
+            if hasattr(self, 'wpm_preview'):
+                self.wpm_preview.set_frame(frame)
+            if hasattr(self, 'lbl_wpm_frame'):
+                self.lbl_wpm_frame.config(text=f"{cur:.0f} wpm  pb:{pb:.0f}")
+        except Exception:
+            pass
+
     def _check_skin_folder(self):
         """Warn if skins/default missing or incomplete."""
         skin_dir = Path(__file__).parent / 'skins' / 'default'
@@ -1757,7 +1897,14 @@ class DP104App:
         skin_dir = Path(__file__).parent / 'skins' / 'default'
         try:
             self._disc_skin = _DISC_MOD.load_skin(str(skin_dir))
-            print(f"[Discord GUI] Skin loaded: {len(self._disc_skin)} variants")
+            n = len(self._disc_skin)
+            print(f"[Discord GUI] Skin loaded: {n} variants from {skin_dir}")
+            if n == 0:
+                self._set_status(f"Skin folder empty — no PNG files found in {skin_dir}")
+            elif n < 12:
+                self._set_status(f"Skin partial: {n}/12 variants loaded — check skins/default/")
+            else:
+                self._set_status(f"Skin loaded: {n} variants ✓")
         except Exception as e:
             self._disc_skin = {}
             print(f"[Discord GUI] Skin load failed: {e}")
@@ -1861,16 +2008,25 @@ class DP104App:
     def _disc_on_state(self, mic_muted, status, deafened):
         """Called by DiscordIPC on mic/deafen/status change. Queues skin frame."""
         self._discord_in_vc = True
+        # Sync GUI status selector to Discord's actual status
+        if hasattr(self, 'disc_status_var'):
+            self.root.after(0, self.disc_status_var.set, status)
         self.root.after(0, self._style_tabs)
         skin = getattr(self, '_disc_skin', {})
         if not skin:
+            self._set_status("Discord: no skin loaded — check skins/default/ folder")
             print("[Discord GUI] No skin loaded — skipping send")
             return
         key   = _DISC_MOD.state_to_key(mic_muted, status, deafened)
         frame = skin.get(key) or skin.get('ggg')
         if not frame:
-            print(f"[Discord GUI] No frame for key '{key}' — skipping")
-            return
+            # Try any available frame as fallback
+            frame = next(iter(skin.values()), None)
+            if not frame:
+                self._set_status(f"Discord: no frame for key '{key}'")
+                print(f"[Discord GUI] No frame for key '{key}' — skipping")
+                return
+            print(f"[Discord GUI] Key '{key}' missing — using fallback frame")
         print(f"[Discord GUI] State → key={key}  queuing PRIO_DISCORD send")
         self.root.after(0, self._update_disc_preview, frame, key,
                         mic_muted, status, deafened)

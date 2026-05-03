@@ -107,7 +107,8 @@ def load_skin(skin_dir):
         candidates = list(skin_dir.glob(f'*{code}*.png')) + \
                      list(skin_dir.glob(f'{code}.png'))
         if not candidates:
-            raise FileNotFoundError(f"Skin file for '{code}' not found in {skin_dir}")
+            print(f"[Skin] WARNING: no file for '{code}' in {skin_dir} — skipping")
+            continue
 
         path = candidates[0]
         img  = Image.open(path).convert('RGB')
@@ -244,7 +245,8 @@ class DiscordIPC:
         self.deafened         = False
         self.status           = 'online'
         self._ever_received   = False
-        self._in_vc           = False      # True when in a voice channel
+        self._in_vc               = False      # True when in a voice channel
+        self._manual_status_set   = None       # tracks what user explicitly set
         self._idle_threshold  = 300
         self._idle_monitoring = True
 
@@ -328,10 +330,25 @@ class DiscordIPC:
 
     # ── State handling ────────────────────────────────────────────────────────
     def _apply_voice_settings(self, data):
+        # Discord RPC GET_VOICE_SETTINGS response structure:
+        # Top-level: { input: {mute:bool}, output: {mute:bool}, ... }  — older format
+        # OR: { mute: bool, deaf: bool }  — simpler format
+        # Check both locations
+        print(f"[IPC] GET_VOICE_SETTINGS data keys: {list(data.keys())[:10]}")
         mute = data.get('mute')
         deaf = data.get('deaf')
+        # Also check nested 'input' object (some Discord versions)
+        if mute is None and 'input' in data:
+            mute = data['input'].get('mute')
+        print(f"[IPC] mute={mute!r} deaf={deaf!r}")
         # Only update fields that are present in the response
         if mute is None and deaf is None:
+            print("[IPC] No mute/deaf in response — forcing first-run callback")
+            # On first poll, force the callback even if no mute/deaf so skin shows
+            if not self._ever_received:
+                self._ever_received = True
+                if self.on_state_change:
+                    self.on_state_change(self.mic_muted, self.status, self.deafened)
             return
         new_mute = bool(mute) if mute is not None else self.mic_muted
         new_deaf = bool(deaf) if deaf is not None else self.deafened
@@ -340,7 +357,9 @@ class DiscordIPC:
         self.mic_muted      = new_mute
         self.deafened       = new_deaf
         self._ever_received = True
+        # Always fire on first receive OR when state changes
         if (changed or first) and self.on_state_change:
+            print(f"[IPC] Firing on_state_change: mute={new_mute} deaf={new_deaf} status={self.status}")
             self.on_state_change(self.mic_muted, self.status, self.deafened)
 
     def set_status(self, status):
@@ -375,8 +394,10 @@ class DiscordIPC:
         One-time OAuth2 authorization via Discord IPC.
         Discord will show a native popup — click Allow.
         Returns an auth code to be exchanged for a token.
-        Requires client_secret to exchange. Adds redirect_uri http://127.0.0.1
-        to your app in discord.com/developers/applications.
+        Requires client_secret to exchange.
+        redirect_uri http://127.0.0.1 must be in discord.com/developers/applications.
+        Note: presence.read is an OAuth2 web scope — not valid in RPC AUTHORIZE.
+              Status sync uses GET_USER and SUBSCRIBE separately after auth.
         """
         print("[Discord IPC] Requesting authorization — watch for Discord popup...")
         nonce = self._next_nonce()
@@ -385,7 +406,8 @@ class DiscordIPC:
             "args":  {
                 "client_id":    self.client_id,
                 "scopes":       ["rpc"],
-                "prompt":       "none",   # skip popup if already approved before
+                # prompt: "none" skips popup but fails if scope changed/deauthed.
+                # Omit it so Discord always shows the native popup on first run.
             },
             "nonce": nonce,
         })
@@ -565,6 +587,26 @@ class DiscordIPC:
         if not authed:
             raise RuntimeError("Could not authenticate with Discord IPC")
 
+        # Get authenticated user's ID so we can subscribe to their presence
+        self._user_id = None
+        self._send(OP_FRAME, {"cmd": "GET_USER", "args": {}, "nonce": self._next_nonce()})
+        try:
+            op, msg = self._recv()
+            user_data = (msg.get('data') or {})
+            self._user_id = user_data.get('id') or (user_data.get('user') or {}).get('id')
+            if self._user_id:
+                print(f"[Discord IPC] User ID: {self._user_id}")
+                # Subscribe to PRESENCE_UPDATE for our own user
+                self._send(OP_FRAME, {
+                    "cmd":   "SUBSCRIBE",
+                    "evt":   "PRESENCE_UPDATE",
+                    "args":  {"user_id": self._user_id},
+                    "nonce": self._next_nonce(),
+                })
+                print("[Discord IPC] Subscribed to PRESENCE_UPDATE")
+        except Exception as e:
+            print(f"[Discord IPC] Could not subscribe to presence: {e}")
+
         print("[Discord IPC] Ready — polling mic/deafen state.")
         if self.on_ready:
             try: self.on_ready()
@@ -578,7 +620,6 @@ class DiscordIPC:
                 # Poll every 2 seconds
                 if now - last_poll >= 2.0:
                     self._cmd("GET_VOICE_SETTINGS")
-                    self._cmd("GET_SELECTED_VOICE_CHANNEL")  # detect VC join/leave
                     self._check_idle()
                     last_poll = now
 
@@ -595,9 +636,37 @@ class DiscordIPC:
                     d   = msg.get('data') or {}
 
                     if evt == 'ERROR':
-                        print(f"[IPC] ERROR code={d.get('code')} msg={d.get('message')}")
-                    if cmd == 'GET_VOICE_SETTINGS' and evt != 'ERROR':
+                        code = d.get('code')
+                        print(f"[IPC] ERROR code={code} msg={d.get('message')}")
+                        if code == 4006:
+                            print("[IPC] Auth expired — will reconnect")
+                            break
+                    elif cmd == 'GET_VOICE_SETTINGS':
                         self._apply_voice_settings(d)
+                    elif evt == 'PRESENCE_UPDATE':
+                        # Dump full payload so we can see exact structure
+                        print(f"[IPC] PRESENCE_UPDATE raw data keys: {list(d.keys())}")
+                        print(f"[IPC] PRESENCE_UPDATE full: {d}")
+                        # Discord pushed a status update for our user
+                        # Try top-level status first, then client_status
+                        raw = (d.get('status') or
+                               d.get('client_status', {}).get('desktop') or
+                               d.get('client_status', {}).get('web') or
+                               d.get('client_status', {}).get('mobile') or '')
+                        mapping = {
+                            'online':  'online',
+                            'idle':    'away',
+                            'dnd':     'dnd',
+                            'offline': 'invisible',
+                        }
+                        new_status = mapping.get(raw)
+                        print(f"[IPC] Presence raw={raw!r} → new_status={new_status!r}")
+                        if new_status and new_status != self.status:
+                            print(f"[Discord IPC] Presence → {raw} ({new_status})")
+                            self.status = new_status
+                            if self._ever_received and self.on_state_change:
+                                self.on_state_change(self.mic_muted,
+                                                     self.status, self.deafened)
                 else:
                     time.sleep(0.05)   # 50ms idle — near-zero CPU
 

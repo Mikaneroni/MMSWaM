@@ -218,3 +218,50 @@
 - `_update_wx_countdown` method added
 
 ---
+
+---
+
+## v1.3.0 — 2026-05-02
+
+### New Features
+
+**WPM Tracker — `dp104_wpm.py`**
+- New module tracking rolling 60-second keystroke average in WPM
+- 24×8 pixel frame layout: 10-bar history graph (cols 2–11, one bar per minute) + current WPM number (cols 13–23, 3×5 pixel font, right-aligned)
+- Color scheme relative to personal best: Green (< 40%) → Yellow (40–80%) → Red (≥ 80%)
+- Personal best cached to `dp104_wpm_pb.json` and persists between sessions
+- Uses Windows `GetAsyncKeyState` polling at 50ms — works inside the GUI process where pynput hooks fail due to tkinter's competing message loop
+- Falls back to pynput listener if Win32 not available
+
+**WPM Tab in GUI**
+- New ⌨ WPM tab — right-click to enable, left-click auto-starts tracker on first visit
+- Live WPM and personal best labels update every poll tick
+- 24×8 pixel preview on the WPM tab
+- **Update interval selector** — Spinbox (1 / 2 / 5 / 10 / 15 / 30 seconds) controls how often the frame is sent to the keyboard. UI readout updates every tick regardless.
+- `PRIO_WPM = 4` — lowest priority, yields to Discord / NP / Weather
+
+---
+
+### Bug Fixes
+
+**Tray restore — abandoned, simplified**
+- Removed `<Unmap>` binding entirely — it fired unreliably on Windows for non-minimize events and the restore path consistently failed regardless of approach (event_generate, flag polling, topmost flash)
+- Window now only goes to tray via the explicit **TRAY** button
+- Normal minimize (taskbar) behaves like any standard window
+
+**`PRIO_WPM` NameError**
+- Constant was referenced in comments and send calls but never defined — crashed the poll thread immediately on first WPM send
+
+**WPM keystroke detection**
+- pynput `Listener` uses `SetWindowsHookEx(WH_KEYBOARD_LL)` which requires the calling thread to have an active Windows message loop — tkinter's loop on the main thread blocked pynput's hook thread from receiving messages
+- Fixed by switching to `GetAsyncKeyState` polling with edge detection (high bit `0x8000` state change `False→True` = new keypress)
+
+**Discord reconnect loop**
+- `_manual_status_set` attribute was missing from `DiscordIPC.__init__` — `_check_idle` accessed it every 2 seconds, raised `AttributeError`, exception handler triggered reconnect, infinite loop
+- Fixed by adding `self._manual_status_set = None` to `__init__`
+
+**Status bar cleanup**
+- Main status message auto-clears after 5 seconds (errors exempt)
+- After clear, only shows enabled service timestamps: `wx:HH:MM:SS · np:HH:MM:SS · disc:HH:MM:SS`
+- Disabled tabs no longer appear in status bar timestamps
+
