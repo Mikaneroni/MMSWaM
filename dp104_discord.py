@@ -334,13 +334,10 @@ class DiscordIPC:
         # Top-level: { input: {mute:bool}, output: {mute:bool}, ... }  — older format
         # OR: { mute: bool, deaf: bool }  — simpler format
         # Check both locations
-        print(f"[IPC] GET_VOICE_SETTINGS data keys: {list(data.keys())[:10]}")
         mute = data.get('mute')
         deaf = data.get('deaf')
-        # Also check nested 'input' object (some Discord versions)
         if mute is None and 'input' in data:
             mute = data['input'].get('mute')
-        print(f"[IPC] mute={mute!r} deaf={deaf!r}")
         # Only update fields that are present in the response
         if mute is None and deaf is None:
             print("[IPC] No mute/deaf in response — forcing first-run callback")
@@ -363,10 +360,12 @@ class DiscordIPC:
             self.on_state_change(self.mic_muted, self.status, self.deafened)
 
     def set_status(self, status):
-        """Manually update online status and trigger redraw if changed."""
+        """Manually update online status. Records _manual_status_set so
+        _check_idle will never override a deliberate user choice."""
+        self._manual_status_set = status   # MUST be set before status changes
         if status != self.status:
             self.status = status
-            if self.on_state_change:
+            if self._ever_received and self.on_state_change:
                 self.on_state_change(self.mic_muted, self.status, self.deafened)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
@@ -594,16 +593,22 @@ class DiscordIPC:
             op, msg = self._recv()
             user_data = (msg.get('data') or {})
             self._user_id = user_data.get('id') or (user_data.get('user') or {}).get('id')
+            print(f"[Discord IPC] GET_USER response: cmd={msg.get('cmd')} evt={msg.get('evt')} id={self._user_id}")
             if self._user_id:
                 print(f"[Discord IPC] User ID: {self._user_id}")
                 # Subscribe to PRESENCE_UPDATE for our own user
+                nonce = self._next_nonce()
                 self._send(OP_FRAME, {
                     "cmd":   "SUBSCRIBE",
                     "evt":   "PRESENCE_UPDATE",
                     "args":  {"user_id": self._user_id},
-                    "nonce": self._next_nonce(),
+                    "nonce": nonce,
                 })
-                print("[Discord IPC] Subscribed to PRESENCE_UPDATE")
+                # Read and log the subscription confirmation
+                op2, msg2 = self._recv()
+                print(f"[Discord IPC] SUBSCRIBE response: cmd={msg2.get('cmd')} evt={msg2.get('evt')} data={msg2.get('data')}")
+            else:
+                print(f"[Discord IPC] Could not get user ID — full response: {msg}")
         except Exception as e:
             print(f"[Discord IPC] Could not subscribe to presence: {e}")
 

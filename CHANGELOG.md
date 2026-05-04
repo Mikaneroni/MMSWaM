@@ -265,3 +265,101 @@
 - After clear, only shows enabled service timestamps: `wx:HH:MM:SS · np:HH:MM:SS · disc:HH:MM:SS`
 - Disabled tabs no longer appear in status bar timestamps
 
+
+---
+
+## v1.3.5 — 2026-05-02
+
+### New Features
+
+**Now Playing — Change-Only Mode**
+- New checkbox: "Only send on song / source change"
+- When enabled, the pixel animation only sends when the source app changes (Spotify → YouTube, etc.), not on every poll tick
+- Tab turns **purple** when change-only mode is active, returns to green on disable or tab switch
+
+**WPM — Three Send Modes**
+- ⏱ **Timer** — sends every X seconds (same as before, configurable spinbox)
+- ✋ **Pause detection** — sends when WPM drops ≥30% from recent peak, catches natural end-of-typing moments
+- 🔀 **Both** — pause detection takes priority; also sends every N minutes as a fallback (seconds spinbox becomes minutes)
+
+**Discord Fallback Options**
+- "When not in VC show:" now includes: Weather, Now Playing, **WPM, Clock, None**
+
+**Remap Test Tool**
+- `dp104_hid_sniffer.py remap` — tests the key remap packet across every interface and packet format, reports which one the keyboard responds to
+
+### Bug Fixes
+
+**Discord status override fixed**
+- `set_status()` in `dp104_discord.py` now records `_manual_status_set` before changing status — `_check_idle` was already checking this flag but `set_status` was never setting it
+- `set_status` only fires `on_state_change` when connected (`_ever_received`), preventing errors on pre-connect status button clicks
+
+**Discord `_disc_on_state` no longer forces `_discord_in_vc = True`**
+- Was setting in-VC flag on every mic/deaf state update, including first-connect polling — caused weather tab to permanently show orange
+- Status selector now only syncs when status actually differs from current GUI value
+
+**NP poll indentation fixed**
+- Source-change gate and `_np_sent` callback were indented incorrectly — could cause pixel send to fire even in change-only mode under certain conditions
+
+**Debug remap buttons fixed**
+- Buttons were using list comprehension lambdas `[func1, func2]` which don't guarantee execution order and called `_set_status` from the wrong thread
+- Replaced with `_do_remap(slot, func, msg)` helper that runs on a worker thread and routes status update back through `root.after(0, ...)`
+- Buttons now show `✓` or `FAILED (keyboard connected?)` in status bar
+
+**Weather default interval: 30 minutes** (was 240)
+
+**Key remap investigation**
+- Discovered captured sniffer packets were `KBD→PC` (keyboard echo/confirmation), not the `PC→KBD` command the web configurator sends
+- Remap may need MI_00 or a different packet format — sniffer remap test mode added to determine correct interface
+
+
+---
+
+## v1.3.5 — 2026-05-04
+
+### New Features
+
+**Now Playing — Change-Only Mode**
+- Checkbox: "Only send on song / source change"
+- When enabled, the pixel display only updates when the source app (Spotify, YouTube, etc.) actually changes — not on every poll tick
+- Tab turns purple when change-only mode is active; returns to green on disable or tab switch
+
+**WPM — Three Send Modes**
+- **⏱ Timer** — sends every X seconds (original behaviour)
+- **✋ Pause detection** — sends when WPM drops ≥30% from the recent typing peak; catches natural breaks in typing without a fixed clock
+- **🔀 Both** — pause detection takes priority; also sends on a minute-interval fallback so the display never goes stale
+
+**Discord Fallback Options**
+- "When not in VC show:" now includes: Weather · Now Playing · WPM · Clock · None
+
+**In-place buffer test** (`dp104_inplace_test.py`)
+- Tested skipping the `0xD1 0x30` header to update the LED buffer without a flash
+- Result: firmware requires the header; in-place writes are rejected
+- Flash masking via send timing is the current approach
+
+### Bug Fixes
+
+**Discord status auto-overriding manual selection — partial fix**
+- `set_status()` in `dp104_discord.py` now correctly records `_manual_status_set` before changing `self.status`
+- `_check_idle` was already checking this flag but it was never being set — idle detection was overriding DnD/Away/Invisible every 2 seconds
+- `_disc_on_state` no longer sets `_discord_in_vc = True` unconditionally — this was keeping the weather tab permanently orange and preventing VC leave fallback
+- GUI status selector now only syncs when status actually differs, preventing flicker on mic/deaf changes
+- **Known remaining:** Discord online status does not yet auto-sync from Discord's actual presence (PRESENCE_UPDATE subscription not yet confirmed working)
+
+**Key remap buttons in debug menu**
+- Fixed button lambdas using `_do_remap(slot, func, msg)` helper — old list-comprehension approach didn't guarantee thread safety for tkinter status updates
+- Buttons now report `✓` or `FAILED (keyboard connected?)` in status bar
+- **Known remaining:** Web configurator may send different PC→KBD bytes than what our sniffer captured (sniffer only reads KBD→PC acknowledgements); actual remap command format TBD pending PC→KBD traffic capture
+
+**Weather default interval**
+- Default changed from 240 minutes (4 hours) to 30 minutes
+
+**NP pixel send indentation**
+- Change-only gate was not properly scoping the `_np_sent` callback — fixed indent
+
+### Notes
+
+**Button remap root cause identified:** The HID sniffer we built reads `KBD→PC` packets — the keyboard's acknowledgement of a remap. To capture the actual remap command the web configurator sends, we need `PC→KBD` traffic via USBPcap/Wireshark USB capture. The format our `remap_key()` sends may be incorrect. Will revisit when PC→KBD packets are captured.
+
+**Brightness fade:** CH585 LED brightness register not exposed through current HID protocol. Revisiting if TickType adds optional transition to cfg.
+
