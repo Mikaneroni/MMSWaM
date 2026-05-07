@@ -191,7 +191,7 @@ MAX_TEXT_LEN     = 30
 PIXEL_W, PIXEL_H = 24, 8
 FRAME_BYTES      = PIXEL_W * PIXEL_H * 3
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 BG   = '#0b0c14'   # near-black background
@@ -1845,7 +1845,9 @@ class DP104App:
                                     _send_wpm = True
 
                         if _send_wpm:
-                            _wf = self._wpm_tracker.get_frame()
+                            _apm = bool(self._wpm_apm_var and self._wpm_apm_var.get()) \
+                                       if self._wpm_apm_var else False
+                            _wf = self._wpm_tracker.get_frame(apm_mode=_apm)
                             send_pixel_animation([_wf], fps=5, priority=PRIO_WPM,
                                                  pin_override=self._pin_priority('wpm'))
 
