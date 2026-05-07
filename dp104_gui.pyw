@@ -191,7 +191,7 @@ MAX_TEXT_LEN     = 30
 PIXEL_W, PIXEL_H = 24, 8
 FRAME_BYTES      = PIXEL_W * PIXEL_H * 3
 
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.4.0"
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 BG   = '#0b0c14'   # near-black background
@@ -287,7 +287,11 @@ FUNC_F13        = (0x00, 0x68)   # F13
 FUNC_PAUSE      = (0x00, 0x48)   # Pause (standard)
 
 def remap_key(slot, func):
-    """Send a key remap command. slot and func are (hi, lo) byte tuples."""
+    """Send a key remap command.
+    Format confirmed via WebHID sniffer:
+      [0x00 report_id] [0x05 cmd] [0x00] [slot_hi] [slot_lo] [func_hi] [func_lo] [0x00 × 26]
+      = 33 bytes total
+    slot and func are (hi, lo) byte tuples."""
     if not _hid:
         return False
     info = find_dp104()
@@ -297,9 +301,10 @@ def remap_key(slot, func):
         try:
             dev = _hid.device()
             dev.open_path(info['path'])
-            pkt = ([0x00, 0x05] + list(slot) + list(func) +
-                   [0x00] * (32 - 6))   # 33 bytes total with report ID
-            dev.write(pkt[:33])
+            pkt = [0x00, 0x05, 0x00] + list(slot) + list(func) + [0x00] * 26
+            # Verify exactly 33 bytes
+            assert len(pkt) == 33, f"remap_key: expected 33 bytes, got {len(pkt)}"
+            dev.write(pkt)
             time.sleep(0.05)
             dev.close()
             return True
@@ -310,10 +315,13 @@ def remap_key(slot, func):
             return False
 
 # ── Public pixel send API (routes through priority queue) ─────────────────────
-def send_pixel_animation(frames, fps=10, priority=PRIO_WEATHER, on_complete=None):
+def send_pixel_animation(frames, fps=10, priority=PRIO_WEATHER, on_complete=None,
+                         pin_override=False):
     """Submit a pixel animation to the priority queue.
+    pin_override: if True, forces priority to 0 (beats everything).
     on_complete(ok, msg) is called on the worker thread after the send finishes."""
-    _PIXEL_QUEUE.submit(priority, frames, fps, on_complete=on_complete)
+    eff_priority = 0 if pin_override else priority
+    _PIXEL_QUEUE.submit(eff_priority, frames, fps, on_complete=on_complete)
     return True, "queued"
 
 # ── HID helpers ───────────────────────────────────────────────────────────────
@@ -758,7 +766,7 @@ class DP104App:
         self.root.report_callback_exception = _report_callback_error
         self.root.bind('<<ShowWindow>>', self._do_show_window)
         self.root.resizable(True, True)
-        self.root.minsize(480, 540)
+        self.root.minsize(644, 656)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
         # Minimize-to-tray only on explicit TRAY button — no <Unmap> binding
@@ -790,13 +798,17 @@ class DP104App:
         self._np_custom         = True
         self._np_change_only_var = None   # BooleanVar created in _build_ui
         self._np_last_source     = None   # True = pixel page, False = text scroll only
+        self._pin_tab_var       = None   # BooleanVar — created in _build_ui
         self._wpm_tracker       = None
         self._wpm_enabled       = None
         self._wpm_mode_var      = None
         self._wpm_min_var       = None
         self._wpm_recent_peak   = 0.0
-        self._clk_controller    = None   # WorldClock instance
-        self._clk_enabled       = None   # BooleanVar
+        self._wpm_apm_var       = None   # BooleanVar — created in _build_ui
+        self._clk_controller    = None
+        self._clk_enabled       = None
+        self._clk_immediate     = False   # send on next tick (F-key pressed)
+        self._clk_last_send_sec = None    # second-of-minute when last sent
 
         self._build_ui()
         self._load_settings()   # load after vars exist
@@ -1184,16 +1196,41 @@ class DP104App:
         self.wpm_panel = _card(r)
         _wh = tk.Frame(self.wpm_panel, bg=BG2)
         _wh.pack(fill='x', pady=(0,6))
-        _label(_wh, "TYPING SPEED").pack(side='left')
+        self.lbl_wpm_mode_hdr = tk.Label(_wh, text="TYPING SPEED (WPM)",
+                                          font=('Consolas',9,'bold'), bg=BG2, fg=DIM)
+        self.lbl_wpm_mode_hdr.pack(side='left')
         self.lbl_wpm_live = tk.Label(_wh, text="— WPM",
                                       font=('Consolas',11,'bold'), bg=BG2, fg=ACC)
         self.lbl_wpm_live.pack(side='right')
         _wp = tk.Frame(self.wpm_panel, bg=BG2)
         _wp.pack(fill='x', pady=(0,4))
-        _label(_wp, "Personal best:", fg=DIM, font=('Consolas',8)).pack(side='left')
+        self.lbl_wpm_unit_hdr = tk.Label(_wp, text="Personal best (WPM):",
+                                          font=('Consolas',8), bg=BG2, fg=DIM)
+        self.lbl_wpm_unit_hdr.pack(side='left')
         self.lbl_wpm_pb = tk.Label(_wp, text="—",
                                     font=('Consolas',8,'bold'), bg=BG2, fg=ACC2)
         self.lbl_wpm_pb.pack(side='left', padx=(6,0))
+
+        # APM mode
+        self._wpm_apm_var = tk.BooleanVar(value=False)
+        _apm_row = tk.Frame(self.wpm_panel, bg=BG2)
+        _apm_row.pack(fill='x', pady=(4,0))
+        tk.Checkbutton(_apm_row, text="Track APM (actions per minute)",
+                       variable=self._wpm_apm_var,
+                       font=('Consolas',8), bg=BG2, fg=DIM,
+                       selectcolor=BG3, activebackground=BG2,
+                       activeforeground=ACC, cursor='hand2').pack(side='left')
+        _apm_live_row = tk.Frame(self.wpm_panel, bg=BG2)
+        _apm_live_row.pack(fill='x', pady=(2,0))
+        _label(_apm_live_row, "APM:", fg=DIM, font=('Consolas',8)).pack(side='left')
+        self.lbl_apm_live = tk.Label(_apm_live_row, text="—",
+                                      font=('Consolas',8,'bold'), bg=BG2, fg='#aaffcc')
+        self.lbl_apm_live.pack(side='left', padx=(6,0))
+        _label(_apm_live_row, "  PB:", fg=DIM, font=('Consolas',8)).pack(side='left')
+        self.lbl_apm_pb = tk.Label(_apm_live_row, text="—",
+                                    font=('Consolas',8), bg=BG2, fg=ACC2)
+        self.lbl_apm_pb.pack(side='left', padx=(6,0))
+
         # ── WPM send mode ──────────────────────────────────────────────────────
         _divider(self.wpm_panel, pady=(6,4))
         _label(self.wpm_panel, "SEND MODE").pack(anchor='w', pady=(0,4))
@@ -1324,25 +1361,37 @@ class DP104App:
         _divider(self.clk_panel, pady=(2,6))
         clk_cities_hdr = tk.Frame(self.clk_panel, bg=BG2)
         clk_cities_hdr.pack(fill='x', pady=(0,2))
-        _label(clk_cities_hdr, "CITIES", fg=DIM).pack(side='left')
+        _label(clk_cities_hdr, "CITIES").pack(side='left')
         _btn(clk_cities_hdr, "+ Add", self._clk_add_city, fg=ACC, bg=BG3).pack(side='right')
 
+        # Color-aware listbox: stores "LABEL  tz_name  color_name"
+        # Each entry is shown in the city's assigned color
         self.clk_listbox = tk.Listbox(self.clk_panel, height=4,
-                                       font=('Consolas',9), bg=BG3, fg=FG,
-                                       selectbackground='#0d3b22',
-                                       selectforeground=ACC,
+                                       font=('Consolas',9,'bold'), bg=BG3, fg=FG,
+                                       selectbackground='#1a1a2e',
+                                       selectforeground='#ffffff',
                                        relief='flat', borderwidth=0,
                                        activestyle='none')
         self.clk_listbox.pack(fill='x', pady=(0,2))
-        for lbl, tz in [('NYC','America/New_York'),('LON','Europe/London'),
-                        ('TYO','Asia/Tokyo'),('UTC','UTC')]:
-            self.clk_listbox.insert(tk.END, f"{lbl}  {tz}")
+
+        # Default cities with colors
+        _clk_defaults = [
+            ('NYC', 'America/New_York', 'cyan'),
+            ('LON', 'Europe/London',   'blue'),
+            ('TYO', 'Asia/Tokyo',      'red'),
+            ('UTC', 'UTC',             'white'),
+        ]
+        for lbl, tz, col in _clk_defaults:
+            self.clk_listbox.insert(tk.END, f"{lbl}  {tz}  {col}")
+            if _CLK_MOD and col in _CLK_MOD.CITY_COLOR_HEX:
+                idx = self.clk_listbox.size() - 1
+                self.clk_listbox.itemconfig(idx, fg=_CLK_MOD.CITY_COLOR_HEX[col])
 
         clk_btn_row = tk.Frame(self.clk_panel, bg=BG2)
         clk_btn_row.pack(fill='x', pady=(0,6))
-        _btn(clk_btn_row, "Remove", self._clk_remove_city, fg=RED, bg=BG3).pack(side='left', padx=(0,6))
-        _btn(clk_btn_row, "▲", self._clk_move_up, fg=DIM, bg=BG3).pack(side='left', padx=(0,4))
-        _btn(clk_btn_row, "▼", self._clk_move_down, fg=DIM, bg=BG3).pack(side='left')
+        _btn(clk_btn_row, "Remove", self._clk_remove_city, fg=RED,  bg=BG3).pack(side='left', padx=(0,6))
+        _btn(clk_btn_row, "▲",     self._clk_move_up,    fg=DIM,  bg=BG3).pack(side='left', padx=(0,4))
+        _btn(clk_btn_row, "▼",     self._clk_move_down,  fg=DIM,  bg=BG3).pack(side='left')
 
         # ── Preview ───────────────────────────────────────────────────────────
         _divider(self.clk_panel, pady=(2,6))
@@ -1392,12 +1441,18 @@ class DP104App:
         _btn(btns, "⟳  SEND NOW",    self._force_send).pack(side='left', padx=(0,6))
         _btn(btns, "↺  RELOAD ALL",  self._reload_all, fg=ACC, bg='#0d1a14').pack(side='left', padx=(0,6))
         _btn(btns, "🗑  CLEAR",       self._clear).pack(side='left', padx=(0,6))
+        self._pin_tab_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(btns, text="📌 Pin tab",
+                       variable=self._pin_tab_var,
+                       font=('Consolas',8), bg=BG, fg=DIM,
+                       selectcolor=BG2, activebackground=BG,
+                       activeforeground=ACC, cursor='hand2').pack(side='left', padx=(4,0))
         _btn(btns, "⊟  TRAY",        self.minimize_to_tray, fg=DIM).pack(side='right')
 
         # ── Init ──────────────────────────────────────────────────────────────
         self._on_mode_change()
         r.update_idletasks()
-        w, h = 500, 605
+        w, h = 644, 656
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
         r.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
@@ -1565,20 +1620,62 @@ class DP104App:
             ))
 
     def minimize_to_tray(self):
-        self.root.withdraw()
-        if not self.tray._running:
+        """Hide window and show tray icon. Rebuilds tray if thread died."""
+        if not pystray or not Image:
+            self.root.iconify()
+            return
+        if not self.tray or not getattr(self.tray, '_running', False):
+            self._build_tray()
+        if self.tray and not self.tray._running:
             threading.Thread(target=self.tray.run, daemon=True).start()
+        self.root.withdraw()
+        try:
+            self.tray.visible = True
+        except Exception:
+            pass
 
     def _show_window(self, icon=None, item=None):
         """Called from pystray thread. Sets a flag — main loop polls and restores."""
         _SHOW_WINDOW_FLAG.set()
 
     def _poll_show_flag(self):
-        """Runs on main thread every 250ms. Restores window if flag is set."""
+        """Runs on main thread every 250ms.
+        - Restores window if tray Show was clicked
+        - Watchdog: rebuilds tray icon if Explorer restarted and cleared it"""
         if _SHOW_WINDOW_FLAG.is_set():
             _SHOW_WINDOW_FLAG.clear()
             self._do_show_window()
+
+        # Tray watchdog — check every 30 seconds
+        _now = getattr(self, '_tray_check_t', 0)
+        import time as _t
+        if _t.monotonic() - _now > 30:
+            self._tray_check_t = _t.monotonic()
+            self._tray_watchdog()
+
         self.root.after(250, self._poll_show_flag)
+
+    def _tray_watchdog(self):
+        """Rebuild tray icon if it has disappeared (e.g. after Explorer restart)."""
+        if not self.tray or not pystray or not Image:
+            return
+        try:
+            running = self.tray._running
+        except Exception:
+            running = False
+        if not running:
+            print("[Tray] Icon lost — rebuilding")
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+            try:
+                self._build_tray()
+                threading.Thread(
+                    target=self.tray.run, daemon=True).start()
+                print("[Tray] Icon restored")
+            except Exception as e:
+                print(f"[Tray] Rebuild failed: {e}")
 
     def _do_show_window(self, event=None):
         """Actual restore — always called on main tkinter thread."""
@@ -1655,15 +1752,33 @@ class DP104App:
                         _now = _dt.datetime.now()
 
                         if _clk_mod == 'still':
-                            # Send once at top of minute (second == 0) or on city change
-                            _at_top = (_now.second < self.interval)
-                            _sent   = getattr(self, '_clk_still_sent', False)
-                            if _at_top and not _sent:
+                            _immediate = getattr(self, '_clk_immediate', False)
+                            _last_sec  = getattr(self, '_clk_last_send_sec', None)
+                            _at_top    = (_now.second < self.interval)
+                            # Skip top-of-minute refresh if within 4s of last send
+                            _too_close = (_last_sec is not None and
+                                          _last_sec >= 56)  # last send was near minute boundary
+
+                            def _clk_sent_cb(ok, msg):
+                                if ok:
+                                    self._clk_last_send_sec = _now.second
+                                    self._set_status("Clock sent ✓")
+
+                            if _immediate:
+                                # F-key pressed — send right now regardless of timing
+                                self._clk_immediate  = False
                                 self._clk_still_sent = True
                                 _cf = self._clk_controller.get_frame()
                                 send_pixel_animation([_cf], fps=5, priority=PRIO_CLOCK,
-                                                     on_complete=lambda ok,msg:
-                                                         self._set_status("Clock sent ✓") if ok else None)
+                                                     pin_override=self._pin_priority('clock'),
+                                                     on_complete=_clk_sent_cb)
+                            elif _at_top and not getattr(self,'_clk_still_sent',False) and not _too_close:
+                                # Top of minute — send unless too close to a previous send
+                                self._clk_still_sent = True
+                                _cf = self._clk_controller.get_frame()
+                                send_pixel_animation([_cf], fps=5, priority=PRIO_CLOCK,
+                                                     pin_override=self._pin_priority('clock'),
+                                                     on_complete=_clk_sent_cb)
                             elif not _at_top:
                                 self._clk_still_sent = False  # reset for next minute
 
@@ -1672,7 +1787,8 @@ class DP104App:
                             if _clk_cd <= 0:
                                 self._clk_countdown = 15.0
                                 _cf = self._clk_controller.get_frame()
-                                send_pixel_animation([_cf], fps=5, priority=PRIO_CLOCK)
+                                send_pixel_animation([_cf], fps=5, priority=PRIO_CLOCK,
+                                                 pin_override=self._pin_priority('clock'))
 
                         elif _clk_mod == 'blink':
                             # Send 10-frame blink animation every 15 seconds
@@ -1680,7 +1796,8 @@ class DP104App:
                                 self._clk_countdown = 15.0
                                 _frames = self._clk_controller.get_frame()
                                 if isinstance(_frames, list):
-                                    send_pixel_animation(_frames, fps=10, priority=PRIO_CLOCK)
+                                    send_pixel_animation(_frames, fps=10, priority=PRIO_CLOCK,
+                                                 pin_override=self._pin_priority('clock'))
 
                 if self._wpm_tracker:
                     self.root.after(0, self._wpm_update_ui)
@@ -1729,7 +1846,8 @@ class DP104App:
 
                         if _send_wpm:
                             _wf = self._wpm_tracker.get_frame()
-                            send_pixel_animation([_wf], fps=5, priority=PRIO_WPM)
+                            send_pixel_animation([_wf], fps=5, priority=PRIO_WPM,
+                                                 pin_override=self._pin_priority('wpm'))
 
                 # ── Now Playing — runs when enabled, regardless of active tab ──
                 np_on = bool(self.np_enabled and self.np_enabled.get())
@@ -1747,7 +1865,7 @@ class DP104App:
                                     self.last_np = (title, artist)
                                     self.root.after(0, self._update_np_display,
                                                     title, artist)
-                                    time.sleep(1.0)  # let keyboard finish text before pixels
+                                    time.sleep(4.5)  # wait for queue cooldown (4s) + margin
                                     # If custom NP enabled and not Discord in VC, send pixel page
                                     if (self._np_custom and _NP_MOD and
                                             not self._discord_in_vc):
@@ -1768,7 +1886,8 @@ class DP104App:
                                                 self._set_status(f"NP send failed: {msg}")
                                         send_pixel_animation(frames, fps=self._fps,
                                                              priority=PRIO_NP,
-                                                             on_complete=_np_sent)
+                                                             on_complete=_np_sent,
+                                                             pin_override=self._pin_priority('nowplaying'))
                                         if self.mode == 'nowplaying':
                                             self._set_status(f"Now Playing sending  [{src}]")
                                     else:
@@ -1878,6 +1997,12 @@ class DP104App:
                 self._do_fetch_weather()
         threading.Thread(target=_do, daemon=True).start()
 
+    def _pin_priority(self, tab):
+        """Return True if Pin tab is checked and this tab is currently selected."""
+        if not self._pin_tab_var:
+            return False
+        return bool(self._pin_tab_var.get()) and self.mode == tab
+
     def _clear(self):
         def _do():
             send_to_keyboard('', '')
@@ -1983,7 +2108,8 @@ class DP104App:
                 self._set_status(f"Weather send failed: {msg}")
 
         send_pixel_animation(frames, fps=self._fps, priority=PRIO_WEATHER,
-                             on_complete=_wx_sent)
+                             on_complete=_wx_sent,
+                             pin_override=self._pin_priority('weather'))
         _toast_weather(data)
 
     # ── Settings ──────────────────────────────────────────────────────────────
@@ -2005,6 +2131,14 @@ class DP104App:
                 'disc_fallback':   self.disc_fallback_var.get() if hasattr(self,'disc_fallback_var')  else 'weather',
                 'disc_autoconnect': self.disc_autoconnect_var.get() if hasattr(self,'disc_autoconnect_var') else False,
                 'np_custom':       self._np_custom_var.get()   if hasattr(self,'_np_custom_var')      else True,
+                'np_change_only':  self._np_change_only_var.get() if self._np_change_only_var else False,
+                'wpm_enabled':     self._wpm_enabled.get()      if self._wpm_enabled                   else False,
+                'wpm_mode':        self._wpm_mode_var.get()     if self._wpm_mode_var                  else 'timer',
+                'wpm_interval':    self._wpm_interval_var.get() if self._wpm_interval_var              else '5',
+                'clk_enabled':     self._clk_enabled.get()      if self._clk_enabled                   else False,
+                'clk_mode':        self._clk_mode_var.get()     if self._clk_mode_var                  else 'still',
+                'clk_fkey':        self._clk_fkey_var.get()     if self._clk_fkey_var                  else '13',
+                'pin_tab':         self._pin_tab_var.get()       if self._pin_tab_var                   else False,
             }
             cfg = Path(__file__).parent / 'dp104_settings.json'
             cfg.write_text(json.dumps(s, indent=2))
@@ -2045,6 +2179,24 @@ class DP104App:
             if 'np_custom' in s and hasattr(self,'_np_custom_var'):
                 self._np_custom_var.set(bool(s['np_custom']))
                 self._np_custom = bool(s['np_custom'])
+            if 'np_change_only' in s and self._np_change_only_var:
+                self._np_change_only_var.set(bool(s['np_change_only']))
+            if 'wpm_enabled' in s and self._wpm_enabled:
+                self._wpm_enabled.set(bool(s['wpm_enabled']))
+            if 'wpm_mode' in s and hasattr(self,'_wpm_mode_var') and self._wpm_mode_var:
+                self._wpm_mode_var.set(s['wpm_mode'])
+            if 'wpm_interval' in s and hasattr(self,'_wpm_interval_var') and self._wpm_interval_var:
+                self._wpm_interval_var.set(s['wpm_interval'])
+            if 'wpm_apm' in s and self._wpm_apm_var:
+                self._wpm_apm_var.set(bool(s['wpm_apm']))
+            if 'clk_enabled' in s and self._clk_enabled:
+                self._clk_enabled.set(bool(s['clk_enabled']))
+            if 'clk_mode' in s and hasattr(self,'_clk_mode_var') and self._clk_mode_var:
+                self._clk_mode_var.set(s['clk_mode'])
+            if 'clk_fkey' in s and hasattr(self,'_clk_fkey_var') and self._clk_fkey_var:
+                self._clk_fkey_var.set(s['clk_fkey'])
+            if 'pin_tab' in s and self._pin_tab_var:
+                self._pin_tab_var.set(bool(s['pin_tab']))
             self.root.after(10, self._style_tabs)
         except Exception:
             pass
@@ -2177,22 +2329,38 @@ class DP104App:
 
     def _clk_stop(self):
         if self._clk_controller:
+            mode = getattr(self._clk_controller, 'mode', 'still')
             self._clk_controller.stop()
             self._clk_controller = None
-            self._set_status("Clock stopped")
+            # Restore keys if STILL mode auto-remapped them
+            if mode == 'still':
+                def _restore():
+                    remap_key(KEY_RED_BUTTON, FUNC_LCD_CHANGE)
+                    remap_key(KEY_PAUSE, FUNC_PAUSE)
+                threading.Thread(target=_restore, daemon=True).start()
+                self._set_status("Clock stopped — keys restored")
+            else:
+                self._set_status("Clock stopped")
 
     def _clk_get_cities(self):
+        """Parse listbox entries — format: 'LABEL  tz_name  color_name'"""
         cities = []
         for i in range(self.clk_listbox.size()):
-            parts = self.clk_listbox.get(i).split(None, 1)
-            if len(parts) == 2:
-                cities.append({'label': parts[0], 'tz': parts[1]})
-        return cities or [{'label': 'UTC', 'tz': 'UTC'}]
+            parts = self.clk_listbox.get(i).split()
+            if len(parts) >= 2:
+                cities.append({
+                    'label': parts[0],
+                    'tz':    parts[1],
+                    'color': parts[2] if len(parts) >= 3 else None,
+                })
+        return cities or [{'label': 'UTC', 'tz': 'UTC', 'color': 'white'}]
 
     def _clk_on_change(self, idx, label, tz):
-        """Called when F-key cycles to next city — reset countdown so new city sends immediately."""
-        self._clk_countdown  = 0
-        self._clk_still_sent = False
+        """Called when F-key cycles to next city.
+        Queues an immediate send and marks that we just sent so the next
+        top-of-minute refresh is skipped if within 4 seconds of it."""
+        self._clk_immediate     = True   # flag: send NOW on next poll tick
+        self._clk_last_send_sec = None   # will be set after the send fires
         self.root.after(0, self._clk_update_ui)
 
     def _clk_update_ui(self):
@@ -2241,14 +2409,62 @@ class DP104App:
             pass
 
     def _clk_add_city(self):
+        """Add a city with label, timezone, and color."""
         import tkinter.simpledialog as sd
-        label = sd.askstring('Add City', 'City label (e.g. NYC):', parent=self.root)
+        label = sd.askstring("Add City", "City label (3 chars, e.g. NYC):", parent=self.root)
         if not label: return
-        tz = sd.askstring('Add City', 'IANA timezone (e.g. America/New_York):', parent=self.root)
+        tz = sd.askstring("Add City", "IANA timezone\n(e.g. America/New_York):", parent=self.root)
         if not tz: return
-        self.clk_listbox.insert(tk.END, f'{label.upper()[:5]}  {tz}')
+        # Color picker dialog
+        color = self._clk_pick_color(label.upper()[:5])
+        if not color: color = "cyan"
+        entry = f"{label.upper()[:5]}  {tz}  {color}"
+        self.clk_listbox.insert(tk.END, entry)
+        if _CLK_MOD and color in _CLK_MOD.CITY_COLOR_HEX:
+            idx = self.clk_listbox.size() - 1
+            self.clk_listbox.itemconfig(idx, fg=_CLK_MOD.CITY_COLOR_HEX[color])
         if self._clk_controller:
             self._clk_controller.cities = self._clk_get_cities()
+
+    def _clk_pick_color(self, city_name):
+        """Simple color picker dialog. Returns color name string."""
+        if not _CLK_MOD:
+            return "cyan"
+        win = tk.Toplevel(self.root)
+        win.title(f"Color for {city_name}")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.grab_set()
+        chosen = tk.StringVar(value="cyan")
+        _label(win, f"Choose color for {city_name}:",
+               fg=FG, font=("Consolas",9)).pack(padx=16, pady=(12,8))
+        color_frame = tk.Frame(win, bg=BG)
+        color_frame.pack(padx=16, pady=(0,8))
+        colors = list(_CLK_MOD.CITY_COLORS.keys())
+        for i, col in enumerate(colors):
+            hex_c = _CLK_MOD.CITY_COLOR_HEX[col]
+            tk.Radiobutton(color_frame, text=col.capitalize(),
+                           variable=chosen, value=col,
+                           font=("Consolas",9,"bold"), bg=BG,
+                           fg=hex_c, selectcolor=BG2,
+                           activebackground=BG, activeforeground=hex_c,
+                           cursor="hand2").grid(row=i//2, column=i%2, sticky="w", padx=8, pady=2)
+        result = [None]
+        def _ok():
+            result[0] = chosen.get()
+            win.destroy()
+        def _cancel():
+            win.destroy()
+        btn_row = tk.Frame(win, bg=BG)
+        btn_row.pack(pady=(4,12))
+        _btn(btn_row, "OK",     _ok,     fg=BG, bg=ACC).pack(side="left", padx=(0,8))
+        _btn(btn_row, "Cancel", _cancel, fg=DIM, bg=BG3).pack(side="left")
+        win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width()  - win.winfo_reqwidth())  // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_reqheight()) // 2
+        win.geometry(f"+{x}+{y}")
+        win.wait_window()
+        return result[0] or "cyan"
 
     def _clk_remove_city(self):
         sel = self.clk_listbox.curselection()
@@ -2296,27 +2512,61 @@ class DP104App:
             self._set_status("WPM tracker stopped")
 
     def _wpm_update_ui(self):
-        """Update WPM panel labels and preview from tracker data."""
+        """Update WPM/APM panel labels and preview. All labels flip when APM is active."""
+        try:
+            apm_on = bool(self._wpm_apm_var and self._wpm_apm_var.get())
+        except Exception:
+            apm_on = False
+        unit = "APM" if apm_on else "WPM"
+
         if not self._wpm_tracker:
             try:
-                self.lbl_wpm_live.config(text="— WPM")
+                self.lbl_wpm_live.config(text=f"— {unit}")
                 self.lbl_wpm_pb.config(text="—")
+                if hasattr(self, 'lbl_apm_live'): self.lbl_apm_live.config(text="—")
+                if hasattr(self, 'lbl_apm_pb'):   self.lbl_apm_pb.config(text="—")
+                if hasattr(self, 'lbl_wpm_mode_hdr'):
+                    self.lbl_wpm_mode_hdr.config(text=f"TYPING SPEED ({unit})")
+                if hasattr(self, 'lbl_wpm_unit_hdr'):
+                    self.lbl_wpm_unit_hdr.config(text=f"Personal best ({unit}):")
             except Exception:
                 pass
             return
-        cur = self._wpm_tracker.current_wpm
-        pb  = self._wpm_tracker.personal_best
+
+        cur  = self._wpm_tracker.current_wpm
+        pb   = self._wpm_tracker.personal_best
+        apm  = self._wpm_tracker.current_apm
+        apb  = self._wpm_tracker.personal_best_apm
+
+        disp = apm  if apm_on else cur
+        dpb  = apb  if apm_on else pb
+
         try:
-            self.lbl_wpm_live.config(text=f"{cur:.0f} WPM")
-            self.lbl_wpm_pb.config(text=f"{pb:.0f} WPM")
+            # Main header and PB label flip to APM
+            if hasattr(self, 'lbl_wpm_mode_hdr'):
+                self.lbl_wpm_mode_hdr.config(text=f"TYPING SPEED ({unit})")
+            if hasattr(self, 'lbl_wpm_unit_hdr'):
+                self.lbl_wpm_unit_hdr.config(text=f"Personal best ({unit}):")
+            self.lbl_wpm_live.config(text=f"{disp:.0f} {unit}")
+            self.lbl_wpm_pb.config(text=f"{dpb:.0f}")
+            # Secondary "Also:" row shows the other metric
+            other_unit = "WPM" if apm_on else "APM"
+            other_val  = cur   if apm_on else apm
+            other_pb   = pb    if apm_on else apb
+            if hasattr(self, 'lbl_apm_live'):
+                self.lbl_apm_live.config(text=f"{other_val:.0f} {other_unit}")
+            if hasattr(self, 'lbl_apm_pb'):
+                self.lbl_apm_pb.config(text=f"{other_pb:.0f}")
         except Exception:
             pass
+
         try:
-            frame = self._wpm_tracker.get_frame()
+            frame = self._wpm_tracker.get_frame(apm_mode=apm_on)
             if hasattr(self, 'wpm_preview'):
                 self.wpm_preview.set_frame(frame)
             if hasattr(self, 'lbl_wpm_frame'):
-                self.lbl_wpm_frame.config(text=f"{cur:.0f} wpm  pb:{pb:.0f}")
+                self.lbl_wpm_frame.config(
+                    text=f"{disp:.0f} {unit.lower()}  pb:{dpb:.0f}")
         except Exception:
             pass
 
@@ -2507,7 +2757,8 @@ class DP104App:
             else:
                 self._set_status(f"Discord send failed: {msg}")
         send_pixel_animation([frame], fps=self._fps, priority=PRIO_DISCORD,
-                             on_complete=_disc_sent)
+                             on_complete=_disc_sent,
+                             pin_override=self._pin_priority('discord'))
         self._set_status(f"Discord sending  mic={_mic} deaf={_deaf} status={_stat}")
 
     def _update_disc_preview(self, frame, key, mic_muted, status, deafened):
@@ -2903,6 +3154,12 @@ class DP104App:
     def _on_close(self):
         self._save_settings()
         self._disc_disconnect()
+        # Restore remapped keys if clock was running in STILL mode
+        if self._clk_controller and getattr(self._clk_controller,'mode','') == 'still':
+            try:
+                remap_key(KEY_RED_BUTTON, FUNC_LCD_CHANGE)
+                remap_key(KEY_PAUSE, FUNC_PAUSE)
+            except Exception: pass
         self.running = False
         if self.tray:
             try: self.tray.stop()

@@ -363,3 +363,68 @@
 
 **Brightness fade:** CH585 LED brightness register not exposed through current HID protocol. Revisiting if TickType adds optional transition to cfg.
 
+
+---
+
+## v1.4.0 — 2026-05-06
+
+### New Features
+
+**World Clock — Color-coded cities**
+- Text label rendering removed entirely (TINY3 font was unreadable at 24×8)
+- Each city now has a named color from a 10-color palette: Red · Orange · Amber · Yellow · Green · Cyan · Blue · Purple · Pink · White
+- Color renders on the keyboard display AND in the GUI city list (city names shown in their assigned color)
+- Default cities: NYC=cyan, LON=blue, TYO=red, UTC=white
+- Color picker dialog when adding a new city — all 10 options shown in their own color as radio buttons
+- City list entry format: `LABEL  tz_name  color_name`
+
+**World Clock — Timing improvements**
+- F-key press (city change) now triggers an immediate send on the next poll tick — no waiting for the minute boundary
+- Smart minute-boundary skip: if the last send was within 4 seconds of the top of the minute (`last_send_sec >= 56`), the top-of-minute refresh is skipped and deferred to the next minute
+- `_clk_immediate` flag set by `_clk_on_change`, checked and cleared by the poll loop
+
+**World Clock — Key restore on stop**
+- STILL mode auto-remaps Red→F13 and Pause→LcdChangeScr on start
+- Disabling the Clock tab now calls `remap_key(KEY_RED_BUTTON, FUNC_LCD_CHANGE)` and `remap_key(KEY_PAUSE, FUNC_PAUSE)` to restore both keys automatically
+- App exit (`_on_close`) also restores keys if STILL mode was active
+
+**Key remap — Fixed**
+- WebHID sniffer (`webhid_sniffer.html`) captured the exact PC→KBD bytes from the TickType web configurator
+- Root cause: our `remap_key()` was missing a `0x00` byte at position 2 and sending 32 bytes instead of 33
+- Correct format confirmed: `[0x00 report_id] [0x05 cmd] [0x00] [slot_hi] [slot_lo] [func_hi] [func_lo] [0x00 × 26]` = 33 bytes
+- Remap buttons in the debug menu now work correctly
+
+**WPM — APM mode improvements**
+- APM (actions per minute) tracked in a separate `_apm_history` deque alongside WPM history
+- APM mode now shows correct per-minute history graph (was showing WPM÷5 graph)
+- All GUI labels flip dynamically when APM checkbox is active: header becomes `TYPING SPEED (APM)`, PB row becomes `Personal best (APM):`, live readout shows value + unit
+- Secondary "Also:" row shows the other metric (WPM when in APM mode, APM when in WPM mode)
+- Preview label updates to `N apm` or `N wpm` accordingly
+- Keyboard display correctly uses APM values and APM personal best for color scaling
+
+**📌 Pin tab**
+- Checkbox next to CLEAR button
+- When checked, the currently selected tab's sends are given priority 0 (beats Discord, NP, Weather, WPM, Clock)
+- Persists to `dp104_settings.json`
+- All five send sites wired: NP, Weather, Discord, WPM, Clock
+
+**WebHID Sniffer (`webhid_sniffer.html`)**
+- Browser-based tool for capturing PC→KBD HID traffic from the TickType web configurator
+- Bookmarklet installs an interceptor on the configurator tab — patches `HIDDevice.prototype.sendReport`
+- Highlights remap packets (`0x05` prefix) in yellow
+- Copy all / Export .txt buttons
+
+### Bug Fixes
+
+**Window size** — Default and minimum set to 644×656
+
+**Settings persistence** — All tab states now saved/loaded: `wpm_enabled`, `wpm_mode`, `wpm_interval`, `wpm_apm`, `clk_enabled`, `clk_mode`, `clk_fkey`, `pin_tab`, `np_change_only`
+
+**NP text+pixel concurrent crash** — Gap between `send_to_keyboard` (text scroll) and pixel queue submit increased from 1s to 4.5s — ensures the queue cooldown expires before the pixel send starts
+
+**World clock overflow** — `_draw_label` was writing a 5-row font into row 0, stomping over the digit rows. Fixed: digits now use rows 0–6 (TALL7 starting at row 0), city color indicator moved to row 7
+
+**Tray watchdog** — Checks every 30 seconds if tray icon thread is still alive; rebuilds if Explorer restarted and cleared it. `minimize_to_tray` also rebuilds tray if thread has died before withdrawing window.
+
+**`<Unmap>` binding removed** — Was firing on tab switches and internal redraws, sending window to tray unexpectedly. Minimize-to-tray now only via TRAY button.
+

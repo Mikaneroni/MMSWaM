@@ -116,13 +116,14 @@ def _draw_digits(canvas, wpm_int, col0, color):
                         canvas[r][c] = color
 
 # ── Frame builder ─────────────────────────────────────────────────────────────
-def build_frame(current_wpm, history_wpm, personal_best):
+def build_frame(current_wpm, history_wpm, personal_best, apm_mode=False):
     """
     Build a single 24×8 HSV frame.
 
-    current_wpm  : float — rolling 60-second average right now
+    current_wpm  : float — rolling 60-second average (WPM or APM depending on apm_mode)
     history_wpm  : list of floats, len ≤ 10, oldest first — one per minute
-    personal_best: float — highest ever 60s average
+    personal_best: float — highest ever value (used for color scaling)
+    apm_mode     : bool — if True, values are APM (no /5 normalization needed)
 
     Returns flat list of ROWS*COLS*3 ints (HSV bytes).
     """
@@ -177,8 +178,11 @@ class WPMTracker:
         self._lock          = threading.Lock()
         self._keystroke_ts  = collections.deque()   # timestamps of recent keystrokes
         self._minute_history= collections.deque(maxlen=HISTORY_BARS)  # wpm per minute
-        self._personal_best = 0.0
-        self._current_wpm   = 0.0
+        self._apm_history   = collections.deque(maxlen=HISTORY_BARS)  # apm per minute
+        self._personal_best     = 0.0
+        self._current_wpm       = 0.0
+        self._current_apm       = 0.0
+        self._personal_best_apm = 0.0
         self._running       = False
         self._listener      = None
         self._pb_file       = Path(pb_file) if pb_file else PB_CACHE_FILE
@@ -189,13 +193,17 @@ class WPMTracker:
         try:
             if self._pb_file.exists():
                 data = json.loads(self._pb_file.read_text())
-                self._personal_best = float(data.get('personal_best', 0))
+                self._personal_best     = float(data.get('personal_best',     0))
+                self._personal_best_apm = float(data.get('personal_best_apm', 0))
         except Exception:
             pass
 
     def _save_pb(self):
         try:
-            self._pb_file.write_text(json.dumps({'personal_best': round(self._personal_best, 1)}))
+            self._pb_file.write_text(json.dumps({
+                'personal_best':     round(self._personal_best, 1),
+                'personal_best_apm': round(self._personal_best_apm, 1),
+            }))
         except Exception:
             pass
 
@@ -213,12 +221,12 @@ class WPMTracker:
 
     # ── Compute WPM ──────────────────────────────────────────────────────────
     def _compute_wpm(self):
+        """Returns (wpm, apm) — WPM = keystrokes/5, APM = raw keystrokes/min."""
         now = time.monotonic()
         with self._lock:
             self._prune_old(now)
             count = len(self._keystroke_ts)
-        # keys in last 60s → words → WPM
-        return count * self.WORDS_PER_KEY
+        return count * self.WORDS_PER_KEY, float(count)
 
     # ── Background update loop ────────────────────────────────────────────────
     def _update_loop(self):
@@ -254,14 +262,18 @@ class WPMTracker:
             # Update WPM every second
             if now - last_second >= 1.0:
                 last_second = now
-                wpm = self._compute_wpm()
+                wpm, apm = self._compute_wpm()
                 with self._lock:
                     self._current_wpm = wpm
+                    self._current_apm = apm
                     if wpm > self._personal_best:
                         self._personal_best = wpm
                         self._save_pb()
+                    if apm > self._personal_best_apm:
+                        self._personal_best_apm = apm
                     if now - last_minute_snap >= 60.0:
                         self._minute_history.append(wpm)
+                        self._apm_history.append(apm)
                         last_minute_snap = now
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -289,6 +301,16 @@ class WPMTracker:
             return self._current_wpm
 
     @property
+    def current_apm(self):
+        with self._lock:
+            return self._current_apm
+
+    @property
+    def personal_best_apm(self):
+        with self._lock:
+            return self._personal_best_apm
+
+    @property
     def personal_best(self):
         with self._lock:
             return self._personal_best
@@ -298,13 +320,14 @@ class WPMTracker:
         with self._lock:
             return list(self._minute_history)
 
-    def get_frame(self):
-        """Return a ready-to-send flat HSV frame for the DP-104."""
+    def get_frame(self, apm_mode=False):
+        """Return a ready-to-send flat HSV frame for the DP-104.
+        apm_mode: if True, displays APM value and uses APM history/PB."""
         with self._lock:
-            cur = self._current_wpm
-            hist = list(self._minute_history)
-            pb   = self._personal_best
-        return build_frame(cur, hist, pb)
+            cur  = self._current_apm         if apm_mode else self._current_wpm
+            hist = list(self._apm_history)   if apm_mode else list(self._minute_history)
+            pb   = self._personal_best_apm   if apm_mode else self._personal_best
+        return build_frame(cur, hist, pb, apm_mode=apm_mode)
 
 
 # ── Quick test ───────────────────────────────────────────────────────────────
