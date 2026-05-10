@@ -168,20 +168,24 @@ class _PixelQueue:
 
     def _worker(self):
         while self._running:
-            self._event.wait()
-            self._event.clear()
-            with self._lock:
-                if not self._pending:
-                    continue
-                best = min(self._pending)
-                frames, fps, on_complete = self._pending.pop(best)
-            ok, msg = _send_direct(frames, fps)
-            if on_complete:
-                try: on_complete(ok, msg)
-                except Exception: pass
-            time.sleep(self.COOLDOWN)
-            if self._pending:
-                self._event.set()
+            try:
+                self._event.wait()
+                self._event.clear()
+                with self._lock:
+                    if not self._pending:
+                        continue
+                    best = min(self._pending)
+                    frames, fps, on_complete = self._pending.pop(best)
+                ok, msg = _send_direct(frames, fps)
+                if on_complete:
+                    try: on_complete(ok, msg)
+                    except Exception: pass
+                time.sleep(self.COOLDOWN)
+                if self._pending:
+                    self._event.set()
+            except Exception as _we:
+                print(f"[Queue worker] Error (thread continuing): {_we}")
+                time.sleep(1.0)
 
 _PIXEL_QUEUE = _PixelQueue()
 DP104_VID        = 0xe560
@@ -191,7 +195,7 @@ MAX_TEXT_LEN     = 30
 PIXEL_W, PIXEL_H = 24, 8
 FRAME_BYTES      = PIXEL_W * PIXEL_H * 3
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.5"
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 BG   = '#0b0c14'   # near-black background
@@ -326,12 +330,25 @@ def send_pixel_animation(frames, fps=10, priority=PRIO_WEATHER, on_complete=None
 
 # ── HID helpers ───────────────────────────────────────────────────────────────
 def find_dp104():
+    """Find DP-104 Raw HID interface (MI_01, interface_number=1).
+    The pixel protocol MUST use MI_01 — other interfaces silently drop packets."""
     if not _hid: return None
-    for info in _hid.enumerate():
-        if info['usage_page'] == RAW_USAGE_PAGE and info.get('vendor_id') == DP104_VID:
+    all_devs = list(_hid.enumerate())
+    # Pass 1: exact match — correct VID/PID and interface 1 (MI_01)
+    for info in all_devs:
+        if (info.get('vendor_id')       == DP104_VID and
+            info.get('product_id')      == DP104_PID and
+            info.get('interface_number') == 1):
             return info
-    for info in _hid.enumerate():
-        if info['usage_page'] == RAW_USAGE_PAGE:
+    # Pass 2: correct VID/PID + Raw HID usage page
+    for info in all_devs:
+        if (info.get('vendor_id')  == DP104_VID and
+            info.get('product_id') == DP104_PID and
+            info.get('usage_page') == RAW_USAGE_PAGE):
+            return info
+    # Pass 3: usage page fallback (last resort)
+    for info in all_devs:
+        if info.get('usage_page') == RAW_USAGE_PAGE:
             return info
     return None
 
@@ -766,7 +783,7 @@ class DP104App:
         self.root.report_callback_exception = _report_callback_error
         self.root.bind('<<ShowWindow>>', self._do_show_window)
         self.root.resizable(True, True)
-        self.root.minsize(644, 656)
+        self.root.minsize(719, 741)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
         # Minimize-to-tray only on explicit TRAY button — no <Unmap> binding
@@ -799,6 +816,7 @@ class DP104App:
         self._np_change_only_var = None   # BooleanVar created in _build_ui
         self._np_last_source     = None   # True = pixel page, False = text scroll only
         self._pin_tab_var       = None   # BooleanVar — created in _build_ui
+        self._auto_resume_var   = None   # BooleanVar — created in _build_ui
         self._wpm_tracker       = None
         self._wpm_enabled       = None
         self._wpm_mode_var      = None
@@ -811,14 +829,15 @@ class DP104App:
         self._clk_last_send_sec = None    # second-of-minute when last sent
 
         self._build_ui()
-        self._load_settings()   # load after vars exist
-        self.root.after(10, self._style_tabs)   # set initial tab colours
+        self._load_settings()
+        self.root.after(10, self._style_tabs)
         self._build_tray()
         self.toggle_running()
         self.root.after(2000, self._check_connection)
         self.root.after(400,  self._tick_preview)
-        self.root.after(1500, self._disc_autoconnect)  # auto-connect if saved creds
-        self.root.after(250, self._poll_show_flag)
+        self.root.after(1500, self._disc_autoconnect)
+        self.root.after(250,  self._poll_show_flag)
+        self.root.after(3000, self._auto_resume_services)
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1447,12 +1466,18 @@ class DP104App:
                        font=('Consolas',8), bg=BG, fg=DIM,
                        selectcolor=BG2, activebackground=BG,
                        activeforeground=ACC, cursor='hand2').pack(side='left', padx=(4,0))
+        self._auto_resume_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(btns, text="↺ Resume on start",
+                       variable=self._auto_resume_var,
+                       font=('Consolas',8), bg=BG, fg=DIM,
+                       selectcolor=BG2, activebackground=BG,
+                       activeforeground=ACC, cursor='hand2').pack(side='left', padx=(8,0))
         _btn(btns, "⊟  TRAY",        self.minimize_to_tray, fg=DIM).pack(side='right')
 
         # ── Init ──────────────────────────────────────────────────────────────
         self._on_mode_change()
         r.update_idletasks()
-        w, h = 644, 656
+        w, h = 719, 741
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
         r.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
@@ -1862,14 +1887,15 @@ class DP104App:
                             if result:
                                 title, artist, app_id = result
                                 if (title, artist) != self.last_np:
-                                    # Always send text scroll first, then wait 1s
-                                    send_to_keyboard(title, artist)
+                                    # Text scroll — skip pixel send if keyboard not connected
+                                    _text_ok = send_to_keyboard(title, artist)
                                     self.last_np = (title, artist)
                                     self.root.after(0, self._update_np_display,
                                                     title, artist)
-                                    time.sleep(4.5)  # wait for queue cooldown (4s) + margin
+                                    if _text_ok:
+                                        time.sleep(4.5)
                                     # If custom NP enabled and not Discord in VC, send pixel page
-                                    if (self._np_custom and _NP_MOD and
+                                    if _text_ok and (self._np_custom and _NP_MOD and
                                             not self._discord_in_vc):
                                         src = _NP_MOD.get_source(app_id)
                                         _co = (self._np_change_only_var is not None
@@ -1937,11 +1963,15 @@ class DP104App:
             time.sleep(self.interval)
 
     def _check_connection(self):
-        info = find_dp104()
-        self.connected = info is not None
-        self.dot.config(fg=ACC if self.connected else RED)
-        if self.tray:
-            self.tray.icon = make_tray_icon(self.connected)
+        try:
+            info = find_dp104()
+            self.connected = info is not None
+            self.dot.config(fg=ACC if self.connected else RED)
+            if self.tray and Image:
+                try: self.tray.icon = make_tray_icon(self.connected)
+                except Exception: pass
+        except Exception:
+            pass
         self.root.after(5000, self._check_connection)
 
     # ── Actions ───────────────────────────────────────────────────────────────
@@ -2137,10 +2167,13 @@ class DP104App:
                 'wpm_enabled':     self._wpm_enabled.get()      if self._wpm_enabled                   else False,
                 'wpm_mode':        self._wpm_mode_var.get()     if self._wpm_mode_var                  else 'timer',
                 'wpm_interval':    self._wpm_interval_var.get() if self._wpm_interval_var              else '5',
+                'wpm_min':         self._wpm_min_var.get()      if self._wpm_min_var                   else '5',
+                'wpm_apm':         self._wpm_apm_var.get()      if self._wpm_apm_var                   else False,
                 'clk_enabled':     self._clk_enabled.get()      if self._clk_enabled                   else False,
                 'clk_mode':        self._clk_mode_var.get()     if self._clk_mode_var                  else 'still',
                 'clk_fkey':        self._clk_fkey_var.get()     if self._clk_fkey_var                  else '13',
                 'pin_tab':         self._pin_tab_var.get()       if self._pin_tab_var                   else False,
+                'auto_resume':     self._auto_resume_var.get()   if self._auto_resume_var               else False,
             }
             cfg = Path(__file__).parent / 'dp104_settings.json'
             cfg.write_text(json.dumps(s, indent=2))
@@ -2185,10 +2218,12 @@ class DP104App:
                 self._np_change_only_var.set(bool(s['np_change_only']))
             if 'wpm_enabled' in s and self._wpm_enabled:
                 self._wpm_enabled.set(bool(s['wpm_enabled']))
-            if 'wpm_mode' in s and hasattr(self,'_wpm_mode_var') and self._wpm_mode_var:
+            if 'wpm_mode' in s and self._wpm_mode_var:
                 self._wpm_mode_var.set(s['wpm_mode'])
-            if 'wpm_interval' in s and hasattr(self,'_wpm_interval_var') and self._wpm_interval_var:
+            if 'wpm_interval' in s and self._wpm_interval_var:
                 self._wpm_interval_var.set(s['wpm_interval'])
+            if 'wpm_min' in s and self._wpm_min_var:
+                self._wpm_min_var.set(s['wpm_min'])
             if 'wpm_apm' in s and self._wpm_apm_var:
                 self._wpm_apm_var.set(bool(s['wpm_apm']))
             if 'clk_enabled' in s and self._clk_enabled:
@@ -2199,6 +2234,8 @@ class DP104App:
                 self._clk_fkey_var.set(s['clk_fkey'])
             if 'pin_tab' in s and self._pin_tab_var:
                 self._pin_tab_var.set(bool(s['pin_tab']))
+            if 'auto_resume' in s and self._auto_resume_var:
+                self._auto_resume_var.set(bool(s['auto_resume']))
             self.root.after(10, self._style_tabs)
         except Exception:
             pass
@@ -2289,6 +2326,23 @@ class DP104App:
                 self._clk_do_remap()
         except Exception as e:
             self._set_status(f"Clock start failed: {e}")
+
+    def _auto_resume_services(self):
+        """If 'Resume on start' is checked, auto-starts services enabled at last exit."""
+        if not (self._auto_resume_var and self._auto_resume_var.get()):
+            return
+        started = []
+        if self._wpm_enabled and self._wpm_enabled.get() and not self._wpm_tracker:
+            self._wpm_start()
+            started.append("WPM")
+        if self._clk_enabled and self._clk_enabled.get() and not self._clk_controller:
+            self._clk_start()
+            started.append("Clock")
+        if self.discord_enabled and self.discord_enabled.get() and not self._discord_connected:
+            self.root.after(500, self._disc_connect)
+            started.append("Discord")
+        if started:
+            self._set_status(f"Auto-resumed: {', '.join(started)}")
 
     def _clk_do_remap(self):
         """Remap Red→F13 and Pause→LcdChangeScr for STILL mode."""
