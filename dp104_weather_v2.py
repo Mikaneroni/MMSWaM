@@ -673,7 +673,16 @@ def draw_text_zone(canvas, temp_f, high_f, low_f, sep=True, is_night=False, text
 
 # ── Frame builder ─────────────────────────────────────────────────────────────
 # Codes that need more frames for a clean long loop
-_FRAME_COUNTS = {1: 20, 2: 20, 5: 20, 7: 30}  # partly=20, cloudy=20, thunder=20, night_pc=30
+_FRAME_COUNTS = {
+    0: 20,   # sunny        — was 10, doubled for smoother sun pulse
+    1: 40,   # partly_cloudy — was 20, doubled
+    2: 40,   # cloudy/house  — was 20, doubled
+    3: 30,   # rainy         — more frames = smoother rain drop motion
+    4: 30,   # snowy         — more frames = smoother snow fall
+    5: 40,   # thunderstorm  — was 20, doubled
+    6: 20,   # night_clear   — star twinkle needs more steps
+    7: 60,   # night_partly  — was 30, doubled
+}
 
 def build_frames(weather=0, temp_f=72, high_f=85, low_f=58,
                  wind_mph=0, num_frames=None):

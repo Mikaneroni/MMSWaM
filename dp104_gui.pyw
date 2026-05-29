@@ -93,6 +93,15 @@ PRIO_NP      = 2   # Now Playing custom pixel page
 PRIO_WEATHER = 3   # Weather animation — lowest priority
 PRIO_WPM     = 4   # WPM tracker
 PRIO_CLOCK   = 5   # World clock — lowest priority
+# Tab order list — index 0 = highest priority. Updated by drag-to-reorder.
+_TAB_ORDER = ['discord', 'nowplaying', 'weather', 'wpm', 'clock']
+
+def _get_prio(tab_key):
+    """Return current priority for a tab key — 1 = highest (leftmost)."""
+    try:
+        return _TAB_ORDER.index(tab_key) + 1
+    except ValueError:
+        return 9
 
 def _send_direct(frames, fps=10, retries=3, retry_delay=2.0):
     """Execute a pixel send synchronously. Called only from _PixelQueue worker.
@@ -108,26 +117,19 @@ def _send_direct_locked(frames, fps=10, retries=3, retry_delay=2.0):
     for attempt in range(1, retries + 1):
         dev = _hid.device()
         opened = False
+        info = find_dp104()
+        if not info:
+            last_err = "Keyboard not found (not connected or wrong interface)"
+            time.sleep(retry_delay)
+            continue
         try:
-            dev.open_path(DP104_PIXEL_PATH)
+            dev.open_path(info['path'])
             dev.set_nonblocking(False)
             opened = True
-        except Exception:
-            pass
-        if not opened:
-            info = find_dp104()
-            if not info:
-                last_err = "Keyboard not found"
-                time.sleep(retry_delay)
-                continue
-            try:
-                dev.open_path(info['path'])
-                dev.set_nonblocking(False)
-                opened = True
-            except Exception as e:
-                last_err = str(e)
-                time.sleep(retry_delay)
-                continue
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(retry_delay)
+            continue
         try:
             send_pixel_frames(dev, frames, fps)
             dev.close()
@@ -190,12 +192,12 @@ class _PixelQueue:
 _PIXEL_QUEUE = _PixelQueue()
 DP104_VID        = 0xe560
 DP104_PID        = 0xe104
-DP104_PIXEL_PATH = b'\\\\?\\HID#VID_E560&PID_E104&MI_01#7&180b41ba&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}'
+# DP104_PIXEL_PATH removed — always enumerate dynamically via find_dp104()
 MAX_TEXT_LEN     = 30
 PIXEL_W, PIXEL_H = 24, 8
 FRAME_BYTES      = PIXEL_W * PIXEL_H * 3
 
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.5.0"
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 BG   = '#0b0c14'   # near-black background
@@ -261,8 +263,12 @@ def send_pixel_frames(dev, frames, fps=10):
     hdr = [0xd1, 0x30, n, fps, PIXEL_H, PIXEL_W] + [0]*26
     dev.write([0x00] + hdr)
     resp = dev.read(32, timeout_ms=2000)
-    if not resp or resp[0] != 0xd1:
-        raise RuntimeError(f"Bad header ACK: {list(resp[:4]) if resp else 'timeout'}")
+    # resp[0] is the HID report ID — actual data starts at resp[1]
+    # Accept any non-empty response as a valid ACK (firmware varies)
+    if not resp:
+        raise RuntimeError("Bad header ACK: timeout — no response from keyboard")
+    if len(resp) > 1 and resp[1] not in (0xd1, 0x00):
+        print(f"[HID] Header ACK unexpected: {list(resp[:4])} — continuing anyway")
     time.sleep(1.0)
 
     chunk_size = 25
@@ -319,7 +325,7 @@ def remap_key(slot, func):
             return False
 
 # ── Public pixel send API (routes through priority queue) ─────────────────────
-def send_pixel_animation(frames, fps=10, priority=PRIO_WEATHER, on_complete=None,
+def send_pixel_animation(frames, fps=10, priority=_get_prio('weather'), on_complete=None,
                          pin_override=False):
     """Submit a pixel animation to the priority queue.
     pin_override: if True, forces priority to 0 (beats everything).
@@ -351,6 +357,26 @@ def find_dp104():
         if info.get('usage_page') == RAW_USAGE_PAGE:
             return info
     return None
+
+def _diag_find_dp104():
+    """Print all HID devices to console — run on startup to debug enumeration."""
+    if not _hid:
+        print("[HID] hidapi not loaded")
+        return
+    print("[HID] Enumerating all HID devices:")
+    for info in _hid.enumerate():
+        vid = info.get('vendor_id', 0)
+        pid = info.get('product_id', 0)
+        mi  = info.get('interface_number', '?')
+        up  = info.get('usage_page', 0)
+        mfr = info.get('manufacturer_string', '')
+        mark = " ← DP-104 FOUND" if (vid==DP104_VID and pid==DP104_PID) else ""
+        print(f"  VID={vid:04x} PID={pid:04x} MI={mi} UP=0x{up:04x} [{mfr}]{mark}")
+    result = find_dp104()
+    if result:
+        print(f"[HID] find_dp104() → MI={result.get('interface_number')} path={result.get('path')}")
+    else:
+        print("[HID] find_dp104() → NOT FOUND — keyboard may not be connected or wrong driver")
 
 def send_to_keyboard(title, artist):
     """Send Now Playing text via scroll protocol.
@@ -628,12 +654,9 @@ def switch_page_safe(page):
     with _HID_LOCK:
         dev = _hid.device()
         try:
-            try:
-                dev.open_path(DP104_PIXEL_PATH)
-            except Exception:
-                info = find_dp104()
-                if not info: return
-                dev.open_path(info['path'])
+            info = find_dp104()
+            if not info: return
+            dev.open_path(info['path'])
             dev.set_nonblocking(False)
             switch_page(dev, page)
             dev.close()
@@ -780,6 +803,12 @@ class DP104App:
 
         self.root = tk.Tk()
         self.root.title("DP-104 Controller")
+        try:
+            _ico = Path(__file__).parent / 'dp104_icon.ico'
+            if _ico.exists():
+                self.root.iconbitmap(str(_ico))
+        except Exception:
+            pass
         self.root.report_callback_exception = _report_callback_error
         self.root.bind('<<ShowWindow>>', self._do_show_window)
         self.root.resizable(True, True)
@@ -815,14 +844,22 @@ class DP104App:
         self._np_custom         = True
         self._np_change_only_var = None   # BooleanVar created in _build_ui
         self._np_last_source     = None   # True = pixel page, False = text scroll only
-        self._pin_tab_var       = None   # BooleanVar — created in _build_ui
-        self._auto_resume_var   = None   # BooleanVar — created in _build_ui
+        self._pin_tab_var       = None
+        self._auto_resume_var   = None
+        self._tab_order         = list(_TAB_ORDER)
+        self._drag_tab          = None
+        self._drag_start_x      = 0
+        self._drag_indicator    = None
         self._wpm_tracker       = None
         self._wpm_enabled       = None
         self._wpm_mode_var      = None
         self._wpm_min_var       = None
         self._wpm_recent_peak   = 0.0
-        self._wpm_apm_var       = None   # BooleanVar — created in _build_ui
+        self._wpm_apm_var       = None
+        self._wpm_fkey_var      = None
+        self._wpm_autoremap_var = None
+        self._wpm_hist_n_var    = None
+        self._wpm_hist_mode_var = None   # BooleanVar — created in _build_ui
         self._clk_controller    = None
         self._clk_enabled       = None
         self._clk_immediate     = False   # send on next tick (F-key pressed)
@@ -834,6 +871,7 @@ class DP104App:
         self._build_tray()
         self.toggle_running()
         self.root.after(2000, self._check_connection)
+        self.root.after(800,  lambda: _diag_find_dp104())  # prints HID info to console
         self.root.after(400,  self._tick_preview)
         self.root.after(1500, self._disc_autoconnect)
         self.root.after(250,  self._poll_show_flag)
@@ -880,26 +918,27 @@ class DP104App:
             btn = tk.Button(
                 tabs, text=label,
                 font=('Consolas',9,'bold'),
-                bg='#0d2b1a', fg=ACC,          # starts green (enabled)
+                bg='#0d2b1a', fg=ACC,
                 relief='flat', padx=6, pady=6, cursor='hand2',
                 activebackground=BG3, activeforeground=ACC,
                 bd=0)
             btn.pack(side='left', padx=(0,4))
             self._tab_btns[val] = btn
 
-            # Left-click → select this tab
-            btn.bind('<Button-1>', lambda e, v=val: self._select_tab(v))
+            # Left-click → select (only if not a drag)
+            btn.bind('<Button-1>',        lambda e, v=val: self._tab_drag_start(e, v))
+            btn.bind('<B1-Motion>',       lambda e, v=val: self._tab_drag_motion(e, v))
+            btn.bind('<ButtonRelease-1>', lambda e, v=val: self._tab_drag_end(e, v))
             # Right-click → toggle enabled
-            btn.bind('<Button-3>', lambda e, v=val, ev=en_var: self._toggle_tab(v, ev))
-            # Also bind on macOS two-finger click / Ctrl+click
-            btn.bind('<Control-Button-1>', lambda e, v=val, ev=en_var: self._toggle_tab(v, ev))
+            btn.bind('<Button-3>',        lambda e, v=val, ev=en_var: self._toggle_tab(v, ev))
+            btn.bind('<Control-Button-1>',lambda e, v=val, ev=en_var: self._toggle_tab(v, ev))
 
         self.discord_enabled = tk.BooleanVar(value=False)
         self._wpm_enabled    = tk.BooleanVar(value=False)
         _make_tab('nowplaying', '  ♪  NOW PLAYING  ', self.np_enabled)
         _make_tab('weather',    '  ⛅  WEATHER  ',    self.wx_enabled)
         _make_tab('discord',    '  🎮  DISCORD  ',    self.discord_enabled)
-        _make_tab('wpm',        '  ⌨  WPM  ',        self._wpm_enabled)
+        _make_tab('wpm',        '  ⌨  WPM ●  ',      self._wpm_enabled)
         self._clk_enabled    = tk.BooleanVar(value=False)
         _make_tab('clock',      '  🕐  CLOCK  ',      self._clk_enabled)
 
@@ -929,7 +968,7 @@ class DP104App:
                         self.wx_enabled and self.wx_enabled.get()):
                     threading.Thread(
                         target=lambda: send_pixel_animation(
-                            list(self._wx_frames), fps=self._fps, priority=PRIO_WEATHER),
+                            list(self._wx_frames), fps=self._fps, priority=_get_prio('weather')),
                         daemon=True).start()
             self._set_status(
                 "NP: custom pixel display" if self._np_custom else "NP: text scroll only")
@@ -1303,6 +1342,58 @@ class DP104App:
         _label(self.wpm_panel, "ℹ  Tracks keystrokes globally  (pip install pynput).\n   Rolling 60s average sent to CUSTOM page at PRIO_WPM.",
                font=('Consolas',7), fg=DIM).pack(anchor='w', pady=(4,0))
 
+        # ── Screen selector & F-key ───────────────────────────────────────────
+        _divider(self.wpm_panel, pady=(8,4))
+        scr_hdr = tk.Frame(self.wpm_panel, bg=BG2)
+        scr_hdr.pack(fill='x', pady=(0,4))
+        _label(scr_hdr, "SCREENS  ●▬★").pack(side='left')
+        self.lbl_wpm_screen = tk.Label(scr_hdr, text="● Live",
+                                        font=('Consolas',8,'bold'), bg=BG2, fg=ACC)
+        self.lbl_wpm_screen.pack(side='right')
+        _label(self.wpm_panel, "F-key cycles: Live → History → Stats → Live",
+               font=('Consolas',7), fg=DIM).pack(anchor='w', pady=(0,4))
+
+        # F-key selector
+        wpm_fkey_row = tk.Frame(self.wpm_panel, bg=BG2)
+        wpm_fkey_row.pack(fill='x', pady=(0,2))
+        _label(wpm_fkey_row, "Cycle key: F", fg=DIM, font=('Consolas',8)).pack(side='left')
+        self._wpm_fkey_var = tk.StringVar(value='13')
+        tk.Spinbox(wpm_fkey_row, values=list(range(13,25)), width=4,
+                   textvariable=self._wpm_fkey_var,
+                   font=('Consolas',8), bg=BG3, fg=FG,
+                   buttonbackground=BG3, insertbackground=FG,
+                   relief='flat').pack(side='left', padx=(2,6))
+        _label(wpm_fkey_row, "(screen cycle)", fg=DIM,
+               font=('Consolas',7)).pack(side='left')
+
+        # Auto-remap checkbox
+        self._wpm_autoremap_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.wpm_panel,
+                       text="Auto-remap Red→F13  Pause→LcdChangeScr on start",
+                       variable=self._wpm_autoremap_var,
+                       font=('Consolas',7), bg=BG2, fg=DIM,
+                       selectcolor=BG3, activebackground=BG2,
+                       cursor='hand2').pack(anchor='w', pady=(0,4))
+
+        # History scale
+        hist_row = tk.Frame(self.wpm_panel, bg=BG2)
+        hist_row.pack(fill='x', pady=(2,4))
+        _label(hist_row, "History shows last", fg=DIM,
+               font=('Consolas',8)).pack(side='left')
+        self._wpm_hist_n_var    = tk.StringVar(value='10')
+        self._wpm_hist_mode_var = tk.StringVar(value='sessions')
+        tk.Spinbox(hist_row, values=(5,10,15,20,24), width=4,
+                   textvariable=self._wpm_hist_n_var,
+                   font=('Consolas',8), bg=BG3, fg=FG,
+                   buttonbackground=BG3, insertbackground=FG,
+                   relief='flat').pack(side='left', padx=(4,4))
+        for val, lbl in [('sessions','sessions'),('days','days')]:
+            tk.Radiobutton(hist_row, text=lbl,
+                           variable=self._wpm_hist_mode_var, value=val,
+                           font=('Consolas',8), bg=BG2, fg=DIM,
+                           selectcolor=BG3, activebackground=BG2,
+                           cursor='hand2').pack(side='left', padx=(2,0))
+
         _divider(self.wpm_panel, pady=(8,6))
         wpm_prev_hdr = tk.Frame(self.wpm_panel, bg=BG2)
         wpm_prev_hdr.pack(fill='x', pady=(0,4))
@@ -1440,8 +1531,18 @@ class DP104App:
             command=self.toggle_running)
         self.btn_pause.pack(side='right')
 
-        tk.Label(status_bar, text="  |  poll:",
-                 font=('Consolas',8), bg=BG, fg=DIM).pack(side='right')
+        # Start with Windows toggle — same size as PAUSE
+        self._startup_enabled = self._check_startup()
+        self.btn_startup = tk.Button(
+            status_bar, text="⊞  STARTUP",
+            font=('Consolas',8,'bold'),
+            bg='#0d2b0d' if self._startup_enabled else '#2b0d0d',
+            fg=ACC if self._startup_enabled else RED,
+            relief='flat', cursor='hand2', padx=8, pady=3,
+            activebackground=BG3,
+            command=self._toggle_startup)
+        self.btn_startup.pack(side='right', padx=(0,4))
+
         self.interval_var = tk.StringVar(value='10')
         tk.Label(status_bar, text="s",
                  font=('Consolas',8), bg=BG, fg=DIM).pack(side='right')
@@ -1547,6 +1648,107 @@ class DP104App:
                 else:
                     btn.config(bg='#0a1f13', fg='#00a060')
 
+    # ── Tab drag-to-reorder ────────────────────────────────────────────────────
+    _DRAG_THRESHOLD = 6   # pixels before we start a drag
+
+    def _tab_drag_start(self, event, val):
+        self._drag_tab      = None
+        self._drag_start_x  = event.x_root
+        self._drag_val      = val
+
+    def _tab_drag_motion(self, event, val):
+        if abs(event.x_root - self._drag_start_x) > self._DRAG_THRESHOLD:
+            self._drag_tab = val
+            # Visual feedback: highlight the dragged tab
+            btn = self._tab_btns.get(val)
+            if btn:
+                btn.config(relief='sunken')
+            # Show drop indicator between nearest tabs
+            self._show_drop_indicator(event.x_root)
+
+    def _tab_drag_end(self, event, val):
+        btn = self._tab_btns.get(val)
+        if btn:
+            btn.config(relief='flat')
+        if self._drag_indicator:
+            try: self._drag_indicator.destroy()
+            except: pass
+            self._drag_indicator = None
+
+        if self._drag_tab is None:
+            # Was a click, not a drag — select the tab
+            self._select_tab(val)
+            return
+
+        # Find target position from x_root
+        target_idx = self._drop_index(event.x_root)
+        src_idx    = self._tab_order.index(val) if val in self._tab_order else 0
+
+        if target_idx != src_idx:
+            self._tab_order.remove(val)
+            self._tab_order.insert(target_idx, val)
+            _TAB_ORDER[:] = self._tab_order   # update global
+            self._repack_tabs()
+            self._set_status(
+                f"Priority order: {' > '.join(k.upper()[:3] for k in self._tab_order)}")
+
+        self._drag_tab = None
+
+    def _drop_index(self, x_root):
+        """Find which position (0-based) to insert based on cursor x."""
+        order = self._tab_order
+        best_idx  = len(order)
+        best_dist = float('inf')
+        for i, key in enumerate(order):
+            btn = self._tab_btns.get(key)
+            if not btn: continue
+            try:
+                bx    = btn.winfo_rootx()
+                bw    = btn.winfo_width()
+                mid_x = bx + bw // 2
+                dist  = abs(x_root - mid_x)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx  = i if x_root < mid_x else i + 1
+            except Exception:
+                pass
+        return min(best_idx, len(order) - 1)
+
+    def _show_drop_indicator(self, x_root):
+        """Draw a thin vertical line showing where the tab will drop."""
+        if self._drag_indicator:
+            try: self._drag_indicator.destroy()
+            except: pass
+        idx = self._drop_index(x_root)
+        # Find x position for the indicator
+        order = self._tab_order
+        try:
+            if idx < len(order):
+                ref = self._tab_btns.get(order[idx])
+                ix = ref.winfo_rootx() - self.root.winfo_rootx() - 2
+            else:
+                ref = self._tab_btns.get(order[-1])
+                ix = ref.winfo_rootx() + ref.winfo_width() - self.root.winfo_rootx() + 2
+            # Place indicator on the tabs frame
+            tab_frame = self._tab_btns[order[0]].master
+            self._drag_indicator = tk.Frame(tab_frame, bg=ACC, width=3, height=28)
+            self._drag_indicator.place(x=ix - tab_frame.winfo_rootx() +
+                                         self.root.winfo_rootx(), y=2)
+        except Exception:
+            pass
+
+    def _repack_tabs(self):
+        """Repack all tab buttons in new drag order."""
+        for key in self._tab_order:
+            btn = self._tab_btns.get(key)
+            if btn:
+                btn.pack_forget()
+        for key in self._tab_order:
+            btn = self._tab_btns.get(key)
+            if btn:
+                btn.pack(side='left', padx=(0,4))
+        self._style_tabs()
+
     def _select_tab(self, val):
         """Left-click: switch active tab view."""
         self.mode_var.set(val)
@@ -1605,6 +1807,10 @@ class DP104App:
         labels = {'nowplaying':'Now Playing','weather':'Weather','discord':'Discord','wpm':'WPM','clock':'Clock'}
         lbl = labels.get(tab, tab)
         self._set_status(f"{lbl} {'enabled' if enabled else 'disabled'}")
+        # Fire an immediate send when a tab is enabled so the keyboard
+        # doesn't stay blank waiting for the next poll tick
+        if enabled:
+            self.root.after(200, lambda t=tab: self._immediate_send(t))
 
     def _on_mode_change(self):
         self.mode = self.mode_var.get()
@@ -1794,14 +2000,14 @@ class DP104App:
                                 self._clk_immediate  = False
                                 self._clk_still_sent = True
                                 _cf = self._clk_controller.get_frame()
-                                send_pixel_animation([_cf], fps=5, priority=PRIO_CLOCK,
+                                send_pixel_animation([_cf], fps=5, priority=_get_prio('clock'),
                                                      pin_override=self._pin_priority('clock'),
                                                      on_complete=_clk_sent_cb)
                             elif _at_top and not getattr(self,'_clk_still_sent',False) and not _too_close:
                                 # Top of minute — send unless too close to a previous send
                                 self._clk_still_sent = True
                                 _cf = self._clk_controller.get_frame()
-                                send_pixel_animation([_cf], fps=5, priority=PRIO_CLOCK,
+                                send_pixel_animation([_cf], fps=5, priority=_get_prio('clock'),
                                                      pin_override=self._pin_priority('clock'),
                                                      on_complete=_clk_sent_cb)
                             elif not _at_top:
@@ -1812,7 +2018,7 @@ class DP104App:
                             if _clk_cd <= 0:
                                 self._clk_countdown = 15.0
                                 _cf = self._clk_controller.get_frame()
-                                send_pixel_animation([_cf], fps=5, priority=PRIO_CLOCK,
+                                send_pixel_animation([_cf], fps=5, priority=_get_prio('clock'),
                                                  pin_override=self._pin_priority('clock'))
 
                         elif _clk_mod == 'blink':
@@ -1821,7 +2027,7 @@ class DP104App:
                                 self._clk_countdown = 15.0
                                 _frames = self._clk_controller.get_frame()
                                 if isinstance(_frames, list):
-                                    send_pixel_animation(_frames, fps=10, priority=PRIO_CLOCK,
+                                    send_pixel_animation(_frames, fps=10, priority=_get_prio('clock'),
                                                  pin_override=self._pin_priority('clock'))
 
                 if self._wpm_tracker:
@@ -1873,7 +2079,7 @@ class DP104App:
                             _apm = bool(self._wpm_apm_var and self._wpm_apm_var.get()) \
                                        if self._wpm_apm_var else False
                             _wf = self._wpm_tracker.get_frame(apm_mode=_apm)
-                            send_pixel_animation([_wf], fps=5, priority=PRIO_WPM,
+                            send_pixel_animation([_wf], fps=5, priority=_get_prio('wpm'),
                                                  pin_override=self._pin_priority('wpm'))
 
                 # ── Now Playing — runs when enabled, regardless of active tab ──
@@ -1913,7 +2119,7 @@ class DP104App:
                                             else:
                                                 self._set_status(f"NP send failed: {msg}")
                                         send_pixel_animation(frames, fps=self._fps,
-                                                             priority=PRIO_NP,
+                                                             priority=_get_prio('nowplaying'),
                                                              on_complete=_np_sent,
                                                              pin_override=self._pin_priority('nowplaying'))
                                         if self.mode == 'nowplaying':
@@ -1935,7 +2141,7 @@ class DP104App:
                                             self.wx_enabled.get()):
                                         threading.Thread(
                                             target=lambda: send_pixel_animation(
-                                                list(self._wx_frames), fps=self._fps, priority=PRIO_WEATHER),
+                                                list(self._wx_frames), fps=self._fps, priority=_get_prio('weather')),
                                             daemon=True).start()
                         finally:
                             np_fetching = False
@@ -1995,7 +2201,7 @@ class DP104App:
                     src    = _NP_MOD.get_source(app_id)
                     frames = _NP_MOD.build_frames(src, True)
                     self._np_frames = frames
-                    send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP,
+                    send_pixel_animation(frames, fps=self._fps, priority=_get_prio('nowplaying'),
                                          on_complete=lambda ok,msg:
                                              self._set_status("NP sent ✓" if ok
                                                               else f"NP send failed: {msg}"))
@@ -2016,7 +2222,8 @@ class DP104App:
                             src    = _NP_MOD.get_source(app_id)
                             frames = _NP_MOD.build_frames(src, True)
                             self._np_frames = frames
-                            send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP,
+                            send_pixel_animation(frames, fps=self._fps,
+                                                 priority=_get_prio('nowplaying'),
                                                  on_complete=lambda ok,msg:
                                                      self._set_status("NP sent ✓" if ok
                                                                       else f"NP send failed: {msg}"))
@@ -2025,8 +2232,58 @@ class DP104App:
                         self._set_status("Send failed")
                 else:
                     self._set_status("Nothing playing")
-            else:
+            elif self.mode == 'weather':
                 self._do_fetch_weather()
+            elif self.mode == 'wpm':
+                if self._wpm_tracker:
+                    _apm = bool(self._wpm_apm_var and self._wpm_apm_var.get())
+                    _wf  = self._wpm_tracker.get_frame(apm_mode=_apm)
+                    send_pixel_animation([_wf], fps=5,
+                                         priority=_get_prio('wpm'),
+                                         pin_override=self._pin_priority('wpm'),
+                                         on_complete=lambda ok,msg:
+                                             self._set_status("WPM sent ✓" if ok else f"WPM send failed: {msg}"))
+                else:
+                    self._wpm_start()
+                    self._set_status("WPM tracker started — send queued")
+            elif self.mode == 'clock':
+                if self._clk_controller:
+                    self._clk_immediate = True
+                    self._set_status("Clock: immediate send queued")
+                else:
+                    self._clk_start()
+                    self._set_status("Clock started")
+            elif self.mode == 'discord':
+                self._set_status("Discord sends on state change — trigger via mic/status")
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _immediate_send(self, tab):
+        """Fire a one-off send for the given tab when first enabled.
+        Uses a background thread so it respects the HID lock without blocking the UI."""
+        def _do():
+            try:
+                if tab == 'weather' and self._wx_frames:
+                    send_pixel_animation(list(self._wx_frames),
+                                         fps=self._fps,
+                                         priority=_get_prio('weather'),
+                                         pin_override=self._pin_priority('weather'))
+                elif tab == 'nowplaying' and self._np_frames:
+                    send_pixel_animation(list(self._np_frames),
+                                         fps=self._fps,
+                                         priority=_get_prio('nowplaying'),
+                                         pin_override=self._pin_priority('nowplaying'))
+                elif tab == 'wpm' and self._wpm_tracker:
+                    _apm = bool(self._wpm_apm_var and self._wpm_apm_var.get())
+                    send_pixel_animation([self._wpm_tracker.get_frame(apm_mode=_apm)],
+                                         fps=5,
+                                         priority=_get_prio('wpm'),
+                                         pin_override=self._pin_priority('wpm'))
+                elif tab == 'clock' and self._clk_controller:
+                    self._clk_immediate = True   # triggers send on next poll tick
+                elif tab == 'discord':
+                    pass   # Discord sends on state change, not on demand
+            except Exception:
+                pass
         threading.Thread(target=_do, daemon=True).start()
 
     def _pin_priority(self, tab):
@@ -2139,14 +2396,42 @@ class DP104App:
             else:
                 self._set_status(f"Weather send failed: {msg}")
 
-        send_pixel_animation(frames, fps=self._fps, priority=PRIO_WEATHER,
+        send_pixel_animation(frames, fps=self._fps, priority=_get_prio('weather'),
                              on_complete=_wx_sent,
                              pin_override=self._pin_priority('weather'))
         _toast_weather(data)
 
     # ── Settings ──────────────────────────────────────────────────────────────
     def _save_settings(self):
-        """Persist settings to JSON on exit."""
+        """Persist settings to JSON on exit.
+        Saves critical flags first so widget-teardown errors during close
+        can't prevent them from persisting."""
+        cfg = Path(__file__).parent / 'dp104_settings.json'
+        # ── Pass 1: patch critical checkboxes into existing file immediately ──
+        try:
+            existing = json.loads(cfg.read_text()) if cfg.exists() else {}
+        except Exception:
+            existing = {}
+        for key, var in [
+            ('auto_resume',    self._auto_resume_var),
+            ('pin_tab',        self._pin_tab_var),
+            ('np_change_only', self._np_change_only_var),
+            ('wpm_enabled',    self._wpm_enabled),
+            ('wpm_apm',        self._wpm_apm_var),
+            ('clk_enabled',    self._clk_enabled),
+            ('disc_enabled',   self.discord_enabled),
+            ('np_enabled',     self.np_enabled),
+            ('wx_enabled',     self.wx_enabled),
+        ]:
+            try:
+                existing[key] = bool(var.get()) if var else existing.get(key, False)
+            except Exception:
+                pass
+        try:
+            cfg.write_text(json.dumps(existing, indent=2))
+        except Exception:
+            pass
+        # ── Pass 2: full settings dict ─────────────────────────────────────────
         try:
             s = {
                 'location':        self.loc_var.get(),
@@ -2174,6 +2459,9 @@ class DP104App:
                 'clk_fkey':        self._clk_fkey_var.get()     if self._clk_fkey_var                  else '13',
                 'pin_tab':         self._pin_tab_var.get()       if self._pin_tab_var                   else False,
                 'auto_resume':     self._auto_resume_var.get()   if self._auto_resume_var               else False,
+                'tab_order':       list(self._tab_order),
+                'clk_cities':      [self.clk_listbox.get(i) for i in range(self.clk_listbox.size())]
+                                   if hasattr(self,'clk_listbox') else [],
             }
             cfg = Path(__file__).parent / 'dp104_settings.json'
             cfg.write_text(json.dumps(s, indent=2))
@@ -2232,10 +2520,25 @@ class DP104App:
                 self._clk_mode_var.set(s['clk_mode'])
             if 'clk_fkey' in s and hasattr(self,'_clk_fkey_var') and self._clk_fkey_var:
                 self._clk_fkey_var.set(s['clk_fkey'])
+            if 'clk_cities' in s and hasattr(self,'clk_listbox') and s['clk_cities']:
+                self.clk_listbox.delete(0, tk.END)
+                for entry in s['clk_cities']:
+                    self.clk_listbox.insert(tk.END, entry)
+                    parts = entry.split()
+                    if len(parts) >= 3 and _CLK_MOD and parts[2] in _CLK_MOD.CITY_COLOR_HEX:
+                        idx = self.clk_listbox.size()-1
+                        self.clk_listbox.itemconfig(idx, fg=_CLK_MOD.CITY_COLOR_HEX[parts[2]])
             if 'pin_tab' in s and self._pin_tab_var:
                 self._pin_tab_var.set(bool(s['pin_tab']))
             if 'auto_resume' in s and self._auto_resume_var:
                 self._auto_resume_var.set(bool(s['auto_resume']))
+            if 'tab_order' in s and isinstance(s['tab_order'], list):
+                known   = list(self._tab_order)
+                loaded  = [t for t in s['tab_order'] if t in known]
+                missing = [t for t in known if t not in loaded]
+                self._tab_order = loaded + missing
+                _TAB_ORDER[:] = self._tab_order
+                self.root.after(50, self._repack_tabs)
             self.root.after(10, self._style_tabs)
         except Exception:
             pass
@@ -2554,9 +2857,23 @@ class DP104App:
             return
         if self._wpm_tracker is None:
             try:
-                self._wpm_tracker = _WPM_MOD.WPMTracker()
+                fkey = int(self._wpm_fkey_var.get()) if self._wpm_fkey_var else 13
+                self._wpm_tracker = _WPM_MOD.WPMTracker(
+                    fkey=fkey,
+                    on_screen_change=self._wpm_on_screen_change)
                 self._wpm_tracker.start()
-                self._set_status("WPM tracker started")
+                do_remap = (self._wpm_autoremap_var is None or
+                            self._wpm_autoremap_var.get())
+                if do_remap:
+                    def _remap():
+                        remap_key(KEY_RED_BUTTON, FUNC_F13)
+                        remap_key(KEY_PAUSE, FUNC_LCD_CHANGE)
+                    threading.Thread(target=_remap, daemon=True).start()
+                    self._set_status("WPM started — Red→F13, Pause→LcdChangeScr")
+                else:
+                    self._set_status("WPM tracker started")
+            except Exception as e:
+                self._set_status(f"WPM start failed: {e}")
             except Exception as e:
                 self._set_status(f"WPM start failed: {e}")
 
@@ -2565,8 +2882,27 @@ class DP104App:
         if self._wpm_tracker:
             self._wpm_tracker.stop()
             self._wpm_tracker = None
-            self._set_status("WPM tracker stopped")
-
+            def _restore():
+                remap_key(KEY_RED_BUTTON, FUNC_LCD_CHANGE)
+                remap_key(KEY_PAUSE, FUNC_PAUSE)
+            threading.Thread(target=_restore, daemon=True).start()
+            self._set_status("WPM tracker stopped — keys restored")
+    def _wpm_on_screen_change(self, screen):
+        """Called from tracker thread when F-key cycles screens."""
+        screen_names = {0:"● Live", 1:"▬ History", 2:"★ Stats"}
+        symbols      = {0:"●",      1:"▬",          2:"★"}
+        label  = screen_names.get(screen, "●")
+        symbol = symbols.get(screen, "●")
+        def _update():
+            try: self.lbl_wpm_screen.config(text=label)
+            except Exception: pass
+            btn = self._tab_btns.get('wpm')
+            if btn:
+                try: btn.config(text=f"  ⌨  WPM  {symbol}  ")
+                except Exception: pass
+        self.root.after(0, _update)
+        self.root.after(0, self._wpm_update_ui)
+    
     def _wpm_update_ui(self):
         """Update WPM/APM panel labels and preview. All labels flip when APM is active."""
         try:
@@ -2620,9 +2956,17 @@ class DP104App:
             frame = self._wpm_tracker.get_frame(apm_mode=apm_on)
             if hasattr(self, 'wpm_preview'):
                 self.wpm_preview.set_frame(frame)
+            scr  = self._wpm_tracker.screen
+            avg  = (self._wpm_tracker.apm_average if apm_on
+                    else self._wpm_tracker.wpm_average)
+            scr_names = {0:"Live", 1:"History", 2:"Stats"}
             if hasattr(self, 'lbl_wpm_frame'):
                 self.lbl_wpm_frame.config(
-                    text=f"{disp:.0f} {unit.lower()}  pb:{dpb:.0f}")
+                    text=f"{disp:.0f} {unit.lower()}  pb:{dpb:.0f}"
+                         f"  avg:{avg:.0f}  [{scr_names.get(scr,'?')}]")
+            if hasattr(self, 'lbl_wpm_screen'):
+                dot = {0:"● Live",1:"▬ History",2:"★ Stats"}
+                self.lbl_wpm_screen.config(text=dot.get(scr,"●"))
         except Exception:
             pass
 
@@ -2812,7 +3156,7 @@ class DP104App:
                 self._set_status(f"Discord sent ✓  mic={_mic} deaf={_deaf} status={_stat}")
             else:
                 self._set_status(f"Discord send failed: {msg}")
-        send_pixel_animation([frame], fps=self._fps, priority=PRIO_DISCORD,
+        send_pixel_animation([frame], fps=self._fps, priority=_get_prio('discord'),
                              on_complete=_disc_sent,
                              pin_override=self._pin_priority('discord'))
         self._set_status(f"Discord sending  mic={_mic} deaf={_deaf} status={_stat}")
@@ -2840,7 +3184,7 @@ class DP104App:
         if fb == 'weather' and self.wx_enabled and self.wx_enabled.get():
             threading.Thread(target=self._do_fetch_weather, daemon=True).start()
         elif fb == 'nowplaying' and self._np_frames:
-            send_pixel_animation(list(self._np_frames), fps=self._fps, priority=PRIO_NP)
+            send_pixel_animation(list(self._np_frames), fps=self._fps, priority=_get_prio('nowplaying'))
 
     # ── Temperature override ──────────────────────────────────────────────────
     def _on_temp_override_toggle(self):
@@ -2889,7 +3233,7 @@ class DP104App:
         frames = list(self._wx_frames)
         fps    = self._fps
         threading.Thread(
-            target=lambda: send_pixel_animation(frames, fps=fps, priority=PRIO_WEATHER),
+            target=lambda: send_pixel_animation(frames, fps=fps, priority=_get_prio('weather')),
             daemon=True).start()
         self._set_status(f"Debug animation sent ({len(frames)} frames)")
 
@@ -3122,7 +3466,7 @@ class DP104App:
         playing = self._debug_np_playing.get()
         frames  = _NP_MOD.build_frames(src, playing)
         _lbl = f"{src} {'playing' if playing else 'paused'}"
-        send_pixel_animation(frames, fps=self._fps, priority=PRIO_NP,
+        send_pixel_animation(frames, fps=self._fps, priority=_get_prio('nowplaying'),
                              on_complete=lambda ok,msg,l=_lbl:
                                  self._set_status(f"Debug NP sent ✓  {l}" if ok
                                                   else f"Debug NP failed: {msg}"))
@@ -3154,7 +3498,7 @@ class DP104App:
         key  = raw.split(' — ')[0].strip()
         frame = skin.get(key) if skin else None
         if frame:
-            send_pixel_animation([frame], fps=self._fps, priority=PRIO_DISCORD,
+            send_pixel_animation([frame], fps=self._fps, priority=_get_prio('discord'),
                                  on_complete=lambda ok,msg,k=key:
                                      self._set_status(f"Discord skin sent ✓  {k}" if ok
                                                       else f"Discord skin failed: {msg}"))
@@ -3210,6 +3554,12 @@ class DP104App:
     def _on_close(self):
         self._save_settings()
         self._disc_disconnect()
+        # Restore WPM keys if tracker was running
+        if self._wpm_tracker:
+            try:
+                remap_key(KEY_RED_BUTTON, FUNC_LCD_CHANGE)
+                remap_key(KEY_PAUSE, FUNC_PAUSE)
+            except Exception: pass
         # Restore remapped keys if clock was running in STILL mode
         if self._clk_controller and getattr(self._clk_controller,'mode','') == 'still':
             try:
@@ -3221,6 +3571,48 @@ class DP104App:
             try: self.tray.stop()
             except: pass
         self.root.destroy()
+
+    def _check_startup(self):
+        """Return True if app is registered in Windows startup."""
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r'Software\Microsoft\Windows\CurrentVersion\Run',
+                0, winreg.KEY_READ)
+            try:
+                winreg.QueryValueEx(key, 'DP104Controller')
+                winreg.CloseKey(key); return True
+            except FileNotFoundError:
+                winreg.CloseKey(key); return False
+        except Exception:
+            return False
+
+    def _toggle_startup(self):
+        """Toggle Start with Windows via registry."""
+        try:
+            import winreg, sys
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r'Software\Microsoft\Windows\CurrentVersion\Run',
+                0, winreg.KEY_SET_VALUE)
+            if self._startup_enabled:
+                try: winreg.DeleteValue(key, 'DP104Controller')
+                except FileNotFoundError: pass
+                self._startup_enabled = False
+                self._set_status("Removed from Windows startup")
+            else:
+                exe    = sys.executable.replace('python.exe','pythonw.exe')
+                script = str(Path(__file__).resolve())
+                winreg.SetValueEx(key, 'DP104Controller', 0,
+                                  winreg.REG_SZ, f'"{exe}" "{script}"')
+                self._startup_enabled = True
+                self._set_status("Added to Windows startup ✓")
+            winreg.CloseKey(key)
+            self.btn_startup.config(
+                bg='#0d2b0d' if self._startup_enabled else '#2b0d0d',
+                fg=ACC       if self._startup_enabled else RED,
+                text="⊞ Startup ✓" if self._startup_enabled else "⊞ Startup")
+        except Exception as e:
+            self._set_status(f"Startup toggle failed: {e}")
 
     def _quit(self):
         self._on_close()

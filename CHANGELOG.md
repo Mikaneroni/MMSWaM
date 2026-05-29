@@ -428,3 +428,107 @@
 
 **`<Unmap>` binding removed** — Was firing on tab switches and internal redraws, sending window to tray unexpectedly. Minimize-to-tray now only via TRAY button.
 
+
+---
+
+## v1.4.7 — 2026-05-09
+
+### Bug Fixes
+
+**WPM settings not persisting across sessions**
+- `wpm_mode` (Timer/Pause/Both) was not restoring on reopen — load guard used `hasattr` which always returned `True` even when the var was `None`, causing the set to never run
+- `wpm_min` (the "Both" mode minute interval) was never added to either the save dict or load block — completely missing
+- `wpm_apm` (Track APM checkbox) was in the load block but missing from the save dict — always wrote `False` on exit regardless of checkbox state
+- All three now correctly save and restore
+
+**Keyboard not receiving pixel sends (critical)**
+- `find_dp104()` was returning the wrong HID interface — it enumerated all devices and returned the first with `usage_page == 0xFF60`, which could be MI_00 (keyboard HID) rather than MI_01 (Raw HID)
+- The pixel protocol (`0xD1 0x30` / `0xD1 0x31`) only works on MI_01; sending to any other interface is silently dropped by the firmware
+- Fixed with three-pass enumeration: (1) exact VID + PID + `interface_number == 1`, (2) VID + PID + usage page, (3) usage page fallback
+- This explains why sends appeared to work (no errors) but the display never updated
+
+**Auto-resume crash on startup**
+- `_auto_resume_var` was scheduled via `root.after(3000, ...)` but never pre-declared as `None` in `__init__`
+- Fired before `_build_ui` completed → `AttributeError: 'DP104App' object has no attribute '_auto_resume_var'`
+- Pre-declared in `__init__` alongside all other BooleanVars
+
+**Keyboard disconnect handling**
+- Queue worker `_worker()` now wrapped in `try/except` — an unhandled exception no longer permanently kills the worker thread
+- `_check_connection()` fully guarded against `Image=None` and HID errors
+- NP poll: `send_to_keyboard` return value checked — pixel send skipped if text send failed (keyboard not present)
+
+### New Features
+
+**Auto-resume on startup**
+- "↺ Resume on start" checkbox in the button row (next to CLEAR)
+- When checked, WPM tracker, Clock, and Discord auto-start 3 seconds after launch if they were enabled at last exit
+- Weather and NP resume automatically regardless (driven by poll loop)
+- Status bar shows `"Auto-resumed: WPM, Clock"` on successful resume
+
+
+---
+
+## v1.5.0 — 2026-05-20
+
+### New Features
+
+**WPM — Three Display Screens (F-key cycled)**
+- **● Live** — existing 10-bar rolling graph + current WPM/APM number (unchanged)
+- **▬ History** — 24-bar session history chart, one bar per saved session, newest rightmost. All-time PB session marked with a bright white dot at the top. Same green/yellow/red color scale relative to PB.
+- **★ Stats** — Two large TALL7 numbers side by side: all-time PB (left, cols 0–11) and all-time average (right, cols 12–23)
+- F-key spinbox in WPM panel (F13–F24, configurable)
+- WPM tab button label updates live: `⌨ WPM ●` / `⌨ WPM ▬` / `⌨ WPM ★`
+- Screen name shown in panel header top-right
+
+**WPM — Session History & Averages**
+- Session peak (WPM and APM) saved to `dp104_wpm_pb.json` on tracker stop or app exit
+- Rolling average computed across all sessions (`total_sessions` counter)
+- `dp104_wpm_pb.json` now stores: `session_history`, `apm_session_history`, `wpm_average`, `apm_average`, `total_sessions`
+- History scale selector: spinbox (5/10/15/20/24) + Sessions or Days radio
+
+**WPM — Key Remap**
+- Auto-remap Red→F13 and Pause→LcdChangeScr when tracker starts (same pattern as Clock STILL mode)
+- Auto-restore both keys on tracker stop and app exit
+- **Auto-remap checkbox** to opt out if managing keys manually
+
+**Start with Windows**
+- `⊞ STARTUP` button in status bar next to PAUSE — red when off, green when on
+- Writes to `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
+- Uses `pythonw.exe` so no console window appears on startup
+- One click to toggle; persists across sessions
+
+**Settings — Bug Fixes & Completeness**
+- `_save_settings` now saves critical checkbox states in a first pass before the full dict write — widget teardown during close can no longer silently drop `auto_resume`, `pin_tab`, `wpm_apm`, etc.
+- `tab_order` and `clk_cities` now properly saved (were loaded but missing from save dict)
+- Clock city list restores with correct colors on load
+
+**SEND NOW — All Tabs**
+- Previously only sent NP and Weather; now dispatches correctly for all five tabs
+- WPM: sends current frame immediately (starts tracker first if not running)
+- Clock: sets `_clk_immediate` flag for next poll tick
+- Discord: shows informational message (event-driven, no demand send)
+
+**Immediate send on tab enable**
+- Enabling any tab (right-click) triggers `_immediate_send` 200ms later
+- Weather and NP send cached frames; WPM sends fresh tracker frame; Clock triggers immediate poll
+
+**Draggable tab priority**
+- Tabs are now drag-to-reorder — leftmost = highest priority
+- `_TAB_ORDER` global list drives `_get_prio(tab_key)` used in all `send_pixel_animation` calls
+- Tab order saved/loaded from `dp104_settings.json`
+
+### Bug Fixes
+
+**Resume on Start not saving**
+- `_auto_resume_var` was created in `_build_ui` but not pre-declared as `None` in `__init__`
+- The `_save_settings` try/except swallowed the failure silently — critical flags now saved in a separate first pass
+
+**SEND NOW did nothing on WPM tab**
+- `_force_send` only handled NP and Weather; fell through to `_do_fetch_weather` for all other tabs
+- Now dispatches per active tab
+
+**UI Polish**
+- `⊞ STARTUP` button: full caps, `Consolas 8 bold`, same `padx=8 pady=3` as PAUSE button
+- `poll:` label removed from status bar
+- WPM tab label includes current screen symbol at all times
+
